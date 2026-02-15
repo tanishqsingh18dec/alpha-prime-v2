@@ -1974,7 +1974,19 @@ def dashboard():
 
 @app.route('/api/state')
 def api_state():
-    return jsonify(global_state)
+    """Return JSON-serializable subset of global state"""
+    # Filter out non-serializable objects (classes)
+    safe_state = {
+        'regime': global_state.get('regime', 'UNKNOWN'),
+        'regime_details': global_state.get('regime_details', {}),
+        'portfolio': global_state.get('portfolio', {}),
+        'positions': global_state.get('positions', {}),
+        'top_ranked': global_state.get('top_ranked', []),
+        'last_slow_update': global_state.get('last_slow_update'),
+        'last_medium_update': global_state.get('last_medium_update'),
+        'last_fast_update': global_state.get('last_fast_update')
+    }
+    return jsonify(safe_state)
 
 @app.route('/api/hud')
 def api_hud():
@@ -2082,39 +2094,47 @@ def api_positions():
         portfolio = global_state.get('portfolio_obj')
         
         if not portfolio:
-            return jsonify({'error': 'Portfolio not initialized'}), 500
+            return jsonify({'positions': []})
         
         positions_list = []
         for symbol, pos in portfolio.positions.items():
-            current_price = portfolio.get_current_price(symbol, pos.get('exchange', 'binance'))
-            if not current_price:
+            try:
+                exchange = pos.get('exchange', 'binance')
+                current_price = portfolio.get_current_price(symbol, exchange)
+                
+                if not current_price:
+                    continue
+                
+                entry_price = pos.get('entry_price', 0)
+                quantity = pos.get('quantity', 0)
+                current_value = quantity * current_price
+                entry_value = pos.get('entry_value', quantity * entry_price)
+                pnl = current_value - entry_value
+                pnl_pct = (pnl / entry_value * 100) if entry_value > 0 else 0
+                
+                positions_list.append({
+                    'symbol': symbol,
+                    'exchange': exchange,
+                    'side': pos.get('side', 'LONG'),
+                    'quantity': quantity,
+                    'entry_price': entry_price,
+                    'current_price': current_price,
+                    'entry_value': entry_value,
+                    'current_value': current_value,
+                    'pnl_dollar': pnl,
+                    'pnl_percent': pnl_pct,
+                    'cycles_held': pos.get('cycles_held', 0),
+                    'entry_time': pos.get('entry_time', '')
+                })
+            except Exception as e:
+                # Skip this position if there's an error
+                print(f"Error processing position {symbol}: {e}")
                 continue
-            
-            entry_price = pos['entry_price']
-            quantity = pos['quantity']
-            current_value = quantity * current_price
-            entry_value = pos['entry_value']
-            pnl = current_value - entry_value
-            pnl_pct = (pnl / entry_value * 100) if entry_value > 0 else 0
-            
-            positions_list.append({
-                'symbol': symbol,
-                'exchange': pos.get('exchange', 'binance'),
-                'side': 'LONG',
-                'quantity': quantity,
-                'entry_price': entry_price,
-                'current_price': current_price,
-                'entry_value': entry_value,
-                'current_value': current_value,
-                'pnl_dollar': pnl,
-                'pnl_percent': pnl_pct,
-                'cycles_held': pos.get('cycles_held', 0),
-                'entry_time': pos.get('entry_time', '')
-            })
         
         return jsonify({'positions': positions_list})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Error in api_positions: {e}")
+        return jsonify({'positions': []})
 
 def run_flask():
     app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False)
