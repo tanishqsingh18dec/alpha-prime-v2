@@ -1451,9 +1451,14 @@ DASHBOARD_HTML = """
             <div class="hud-value" id="hudNlv">$0.00</div>
         </div>
         <div class="hud-item">
-            <div class="hud-label">Daily P&L</div>
-            <div class="hud-value" id="hudDailyPnl">$0.00</div>
-            <div class="hud-sub" id="hudDailyPnlPct">0.00%</div>
+            <div class="hud-label">Realized P&L</div>
+            <div class="hud-value" id="hudRealizedPnl">$0.00</div>
+            <div class="hud-sub">Closed trades</div>
+        </div>
+        <div class="hud-item">
+            <div class="hud-label">Unrealized P&L</div>
+            <div class="hud-value" id="hudUnrealizedPnl">$0.00</div>
+            <div class="hud-sub">Open positions</div>
         </div>
         <div class="hud-item">
             <div class="hud-label">Buying Power</div>
@@ -1748,13 +1753,14 @@ DASHBOARD_HTML = """
 
             document.getElementById('hudNlv').textContent = '$' + d.nlv.toFixed(2);
 
-            const pnlEl = document.getElementById('hudDailyPnl');
-            pnlEl.textContent = (d.daily_pnl_dollar >= 0 ? '+$' : '-$') + Math.abs(d.daily_pnl_dollar).toFixed(2);
-            pnlEl.className = 'hud-value ' + colorVal(d.daily_pnl_dollar);
+            const realizedPnlEl = document.getElementById('hudRealizedPnl');
+            realizedPnlEl.textContent = (d.realized_pnl >= 0 ? '+$' : '-$') + Math.abs(d.realized_pnl).toFixed(2);
+            realizedPnlEl.className = 'hud-value ' + colorVal(d.realized_pnl);
 
-            const pctEl = document.getElementById('hudDailyPnlPct');
-            pctEl.textContent = (d.daily_pnl_percent >= 0 ? '+' : '') + d.daily_pnl_percent.toFixed(2) + '%';
-            pctEl.className = 'hud-sub ' + colorVal(d.daily_pnl_percent);
+            const unrealizedPnlEl = document.getElementById('hudUnrealizedPnl');
+            unrealizedPnlEl.textContent = (d.unrealized_pnl >= 0 ? '+$' : '-$') + Math.abs(d.unrealized_pnl).toFixed(2);
+            unrealizedPnlEl.className = 'hud-value ' + colorVal(d.unrealized_pnl);
+
 
             document.getElementById('hudBuyingPower').textContent = '$' + (d.buying_power || d.nlv).toFixed(2);
             document.getElementById('hudMarginUtil').textContent = d.margin_utilization_pct.toFixed(1) + '%';
@@ -1976,6 +1982,7 @@ def api_hud():
     try:
         analytics = global_state.get('analytics')
         execution_monitor = global_state.get('execution_monitor')
+        portfolio = global_state.get('portfolio_obj')
         
         if not analytics:
             return jsonify({'error': 'Analytics not initialized'}), 500
@@ -1987,6 +1994,15 @@ def api_hud():
         
         latency = execution_monitor.get_avg_latency() if execution_monitor else 0
         
+        # Calculate realized and unrealized P&L
+        realized_pnl = portfolio.total_pnl if portfolio else 0  # From closed trades
+        
+        # Sum up unrealized P&L from all open positions
+        unrealized_pnl = 0
+        if portfolio:
+            for symbol, pos in portfolio.positions.items():
+                unrealized_pnl += pos.get('unrealized_pnl', 0)
+        
         return jsonify({
             'nlv': nlv,
             'daily_pnl_dollar': daily_pnl['pnl_dollar'],
@@ -1996,7 +2012,9 @@ def api_hud():
             'margin_utilization_pct': exposure['long_pct'],
             'system_status': global_state.get('regime', 'UNKNOWN'),
             'api_latency_ms': latency,
-            'connection_status': 'CONNECTED'
+            'connection_status': 'CONNECTED',
+            'realized_pnl': realized_pnl,
+            'unrealized_pnl': unrealized_pnl
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
