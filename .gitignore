@@ -8,3 +8,4 @@ legacy_archive/
 .env
 secret.py
 key.pem
+*.jsonl

@@ -19,7 +19,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import threading
 import time
 import json
@@ -441,7 +441,7 @@ class PortfolioAnalytics:
     
     def calculate_sharpe_ratio(self, period_days=30):
         """Sharpe Ratio: (Return - RiskFree) / Volatility"""
-        if len(self.equity_history) < period_days:
+        if len(self.equity_history) < 2:  # Adjusted for faster visibility
             return 0
         
         recent = self.equity_history[-period_days:]
@@ -467,7 +467,7 @@ class PortfolioAnalytics:
     
     def calculate_sortino_ratio(self, period_days=30):
         """Sortino Ratio: Only penalize downside volatility"""
-        if len(self.equity_history) < period_days:
+        if len(self.equity_history) < 2:  # Adjusted for faster visibility
             return 0
         
         recent = self.equity_history[-period_days:]
@@ -496,7 +496,7 @@ class PortfolioAnalytics:
     
     def calculate_var_95(self):
         """Value at Risk (95% confidence, 24h)"""
-        if len(self.equity_history) < 30:
+        if len(self.equity_history) < 5:  # Adjusted for faster visibility
             return 0
         
         recent = self.equity_history[-288:]  # Last 24h (5-min intervals)
@@ -615,6 +615,84 @@ class ExecutionMonitor:
         avg_latency = np.mean([l['latency_ms'] for l in recent])
         
         return avg_latency
+
+# =============================================================================
+# EVENT LOGGER (Server-Side Log Stream)
+# =============================================================================
+
+class EventLogger:
+    """Thread-safe event logger for streaming server-side events to dashboard."""
+    
+    def __init__(self, log_file='alpha_prime_events.jsonl', max_events=500):
+        self.events = []  # List of {timestamp, type, message, details}
+        self.max_events = max_events
+        self.log_file = log_file
+        self._lock = threading.Lock()
+        self._event_id = 0
+        self._load_from_file()
+    
+    def _load_from_file(self):
+        """Load recent events from log file on startup"""
+        if not os.path.exists(self.log_file):
+            return
+            
+        try:
+            with open(self.log_file, 'r') as f:
+                lines = f.readlines()
+                # Load last N lines to avoid reading massive files
+                start_idx = max(0, len(lines) - self.max_events)
+                
+                for line in lines[start_idx:]:
+                    try:
+                        event = json.loads(line)
+                        self.events.append(event)
+                        # Keep ID counter in sync
+                        self._event_id = max(self._event_id, event.get('id', 0))
+                    except:
+                        continue
+                        
+            print(f"📂 Loaded {len(self.events)} events from {self.log_file}")
+            
+        except Exception as e:
+            print(f"⚠️  Could not load events: {e}")
+
+    def log(self, event_type, message, details=None):
+        """Log an event. Types: info, buy, sell, trim, regime, signal, warn, error"""
+        with self._lock:
+            self._event_id += 1
+            event = {
+                'id': self._event_id,
+                'timestamp': datetime.now().isoformat(),
+                'type': event_type,
+                'message': message,
+                'details': details or {}
+            }
+            
+            # Memory
+            self.events.append(event)
+            if len(self.events) > self.max_events:
+                self.events = self.events[-self.max_events:]
+            
+            # File Persistence
+            try:
+                with open(self.log_file, 'a') as f:
+                    f.write(json.dumps(event) + "\n")
+            except Exception as e:
+                print(f"⚠️  Could not write event to file: {e}")
+    
+    def get_events(self, since_id=0, limit=100):
+        """Get events after a given ID (for incremental polling)."""
+        with self._lock:
+            if since_id == 0:
+                return self.events[-limit:]
+            return [e for e in self.events if e['id'] > since_id][-limit:]
+    
+    def get_latest_id(self):
+        with self._lock:
+            return self._event_id
+
+# Global event logger instance
+event_logger = EventLogger()
 
 # =============================================================================
 # LAYER 5: EXECUTION ENGINE (Entry, Exit, Trim)
@@ -833,6 +911,9 @@ class PaperPortfolio:
         self.log_trade('BUY', symbol, quantity, price, reason=f"Score: {details['final_score']:.2f} | {exchange_name.upper()}")
         self.save_portfolio()
         print(f"✅ BUY {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} (${position_value:.2f})")
+        event_logger.log('buy', f'BUY {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} (${position_value:.2f})', {
+            'symbol': symbol, 'exchange': exchange_name, 'price': price, 'quantity': quantity, 'value': position_value, 'score': details.get('final_score', 0)
+        })
         return True
     
     def execute_sell(self, symbol, reason):
@@ -866,6 +947,9 @@ class PaperPortfolio:
         
         emoji = "🟢" if pnl > 0 else "🔴"
         print(f"{emoji} SELL {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%) | {reason}")
+        event_logger.log('sell', f'SELL {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%) | {reason}', {
+            'symbol': symbol, 'exchange': exchange_name, 'price': price, 'quantity': quantity, 'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason
+        })
         return True
     
     def execute_trim(self, symbol, reason):
@@ -896,6 +980,9 @@ class PaperPortfolio:
         self.save_portfolio()
         
         print(f"📉 TRIM {symbol}: {TRIM_PERCENTAGE*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}")
+        event_logger.log('trim', f'TRIM {symbol}: {TRIM_PERCENTAGE*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}', {
+            'symbol': symbol, 'price': price, 'quantity': trim_qty, 'pnl': pnl, 'reason': reason
+        })
         return True
 
 # =============================================================================
@@ -949,12 +1036,14 @@ class AlphaPrime:
         # Emergency drawdown checks could go here
         # For now, just observe
         print(f"   Portfolio: ${global_state['portfolio_value']:.2f} | Cash: ${self.portfolio.balance:.2f}")
+        event_logger.log('info', f'Portfolio: ${global_state["portfolio_value"]:.2f} | Cash: ${self.portfolio.balance:.2f} | {len(self.portfolio.positions)} positions')
     
     def medium_loop(self):
         """
         5-minute loop: Check trend breaks, stop-losses, trims.
         """
         print(f"\n⚙️  MEDIUM CHECK - {datetime.now().strftime('%H:%M:%S')}")
+        event_logger.log('info', 'Medium cycle: checking exits and trims')
         
         # Check exit conditions for all positions
         for symbol in list(self.portfolio.positions.keys()):
@@ -995,9 +1084,14 @@ class AlphaPrime:
         global_state['regime'] = regime
         global_state['regime_details'] = details
         
+        event_logger.log('regime', f'Regime: {regime} | BTC: ${details.get("btc_price", 0):.0f} vs EMA200 ${details.get("btc_ema200", 0):.0f} | Breadth: {details.get("breadth_pct", 0):.0%}', {
+            'regime': regime, 'btc_price': details.get('btc_price', 0), 'btc_ema200': details.get('btc_ema200', 0)
+        })
+        
         # If Risk-Off, exit everything
         if regime == 'RISK_OFF':
             print("   ⚠️  RISK-OFF DETECTED → EXITING ALL POSITIONS")
+            event_logger.log('warn', 'RISK-OFF DETECTED — exiting all positions')
             for symbol in list(self.portfolio.positions.keys()):
                 self.portfolio.execute_sell(symbol, "Risk-Off Regime")
             return
@@ -1028,6 +1122,10 @@ class AlphaPrime:
             print(f"   {coin['symbol']:<12} {coin['final_score']:>9.4f} {coin['momentum_7d']:>7.1%} {coin['momentum_24h']:>7.1%} {coin['volatility']:>7.4f} {trend_status}")
         
         global_state['top_coins'] = top_n
+        
+        # Log top coins as signal events
+        for coin in top_n:
+            event_logger.log('signal', f'RANKED #{top_n.index(coin)+1}: {coin["symbol"]} | Score: {coin["final_score"]:.4f} | Mom7d: {coin["momentum_7d"]:.1%} | {coin.get("exchange","binance").upper()}')
         
         # LAYER 4: Position Sizing
         print("\n💰 LAYER 4: POSITION SIZING (Inverse Volatility)")
@@ -1078,6 +1176,8 @@ class AlphaPrime:
         print(f"   Cash: ${self.portfolio.balance:.2f} | Positions: {len(self.portfolio.positions)}")
         print(f"   Trades: {self.portfolio.total_trades} | Win Rate: {win_rate:.0f}%")
         print(f"{'='*80}\n")
+        
+        event_logger.log('info', f'Slow cycle complete — NLV: ${portfolio_value:.2f} ({total_return_pct:+.1f}%) | {len(self.portfolio.positions)} positions | Win rate: {win_rate:.0f}%')
     
     def run(self):
         """
@@ -1576,6 +1676,32 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
+        <!-- ─── TOP RANKED UNIVERSE ─── -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">Alpha Rankings</div>
+                <div class="card-badge" id="rankCount">0 coins</div>
+            </div>
+            <div id="rankingsContainer">
+                <table class="data-table" id="rankingsTable">
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Coin</th>
+                            <th>Score</th>
+                            <th>Mom 7d</th>
+                            <th>Mom 24h</th>
+                            <th>Vol</th>
+                            <th>Trend</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rankingsBody">
+                    </tbody>
+                </table>
+                <div class="no-data" id="noRankings">Waiting for first scan...</div>
+            </div>
+        </div>
+
         <!-- ─── EXECUTION QUALITY ─── -->
         <div class="card">
             <div class="card-header">
@@ -1626,7 +1752,7 @@ DASHBOARD_HTML = """
                 <div class="card-badge" id="logCount">0 events</div>
             </div>
             <div class="log-terminal" id="logTerminal">
-                <div class="log-line log-info"><span class="log-ts">[--:--:--]</span> Waiting for data...</div>
+                <div class="log-line log-info"><span class="log-ts">[--:--:--]</span> Connecting to Alpha Prime v2...</div>
             </div>
         </div>
 
@@ -1725,13 +1851,7 @@ DASHBOARD_HTML = """
         // ═══ DATA FETCHING & RENDERING ═══
 
         const logs = [];
-
-        function addLog(type, msg) {
-            const now = new Date();
-            const ts = now.toTimeString().slice(0,8);
-            logs.push({type, msg, ts});
-            if (logs.length > 200) logs.shift();
-        }
+        let lastLogId = 0;
 
         function colorVal(value, invert) {
             if (value > 0) return invert ? 'text-red' : 'text-green';
@@ -1891,6 +2011,41 @@ DASHBOARD_HTML = """
             }
         }
 
+        async function updateRankings() {
+            const d = await fetchJSON('/api/top_ranked');
+            if (!d || d.error) return;
+
+            const ranked = d.ranked || [];
+            document.getElementById('rankCount').textContent = ranked.length + ' coins';
+
+            const tbody = document.getElementById('rankingsBody');
+            const noData = document.getElementById('noRankings');
+
+            if (ranked.length === 0) {
+                tbody.innerHTML = '';
+                noData.style.display = 'flex';
+                return;
+            }
+            noData.style.display = 'none';
+
+            let html = '';
+            ranked.forEach(c => {
+                const trendIcon = c.trend_filter === 1 ? '<span class="text-green">▲</span>' : '<span class="text-red">▼</span>';
+                const momClass7 = c.momentum_7d >= 0 ? 'text-green' : 'text-red';
+                const momClass24 = c.momentum_24h >= 0 ? 'text-green' : 'text-red';
+                html += '<tr>';
+                html += '<td class="text-muted">' + c.rank + '</td>';
+                html += '<td style="color:hsl(var(--foreground));font-weight:500">' + c.symbol.replace('/USDT','') + '<span class="text-muted" style="font-size:10px;margin-left:3px">' + c.exchange.toUpperCase().slice(0,3) + '</span></td>';
+                html += '<td class="text-blue">' + c.final_score.toFixed(3) + '</td>';
+                html += '<td class="' + momClass7 + '">' + (c.momentum_7d * 100).toFixed(1) + '%</td>';
+                html += '<td class="' + momClass24 + '">' + (c.momentum_24h * 100).toFixed(1) + '%</td>';
+                html += '<td>' + c.volatility.toFixed(4) + '</td>';
+                html += '<td>' + trendIcon + '</td>';
+                html += '</tr>';
+            });
+            tbody.innerHTML = html;
+        }
+
         async function updateStats() {
             const d = await fetchJSON('/api/state');
             if (!d) return;
@@ -1928,12 +2083,29 @@ DASHBOARD_HTML = """
                     document.getElementById('concentrationBars').innerHTML = bars;
                 }
             }
-
-            // Update logs
-            addLog('info', 'State refreshed — NLV: $' + (d.portfolio_value || 0).toFixed(2));
         }
 
-        function renderLogs() {
+        async function updateLogs() {
+            const d = await fetchJSON('/api/logs?since_id=' + lastLogId + '&limit=100');
+            if (!d || d.error) return;
+
+            if (d.events && d.events.length > 0) {
+                d.events.forEach(e => {
+                    const ts = e.timestamp ? e.timestamp.split('T')[1].slice(0,8) : '--:--:--';
+                    let logType = 'info';
+                    if (e.type === 'buy') logType = 'buy';
+                    else if (e.type === 'sell') logType = 'sell';
+                    else if (e.type === 'trim') logType = 'sell';
+                    else if (e.type === 'regime') logType = 'action';
+                    else if (e.type === 'signal') logType = 'action';
+                    else if (e.type === 'warn' || e.type === 'error') logType = 'warn';
+                    logs.push({type: logType, msg: e.message, ts});
+                });
+                if (logs.length > 200) logs.splice(0, logs.length - 200);
+                lastLogId = d.latest_id;
+            }
+
+            // Render logs
             const el = document.getElementById('logTerminal');
             const recent = logs.slice(-50);
             el.innerHTML = recent.map(l =>
@@ -1951,14 +2123,13 @@ DASHBOARD_HTML = """
                 updateRisk(),
                 updateExecution(),
                 updateEquityCurve(),
+                updateRankings(),
                 updateStats(),
+                updateLogs(),
             ]);
-            renderLogs();
         }
 
         initChart();
-        addLog('info', 'Dashboard initialized');
-        addLog('info', 'Connecting to Alpha Prime v2...');
         tick();
         setInterval(tick, 5000);
     </script>
@@ -2136,6 +2307,48 @@ def api_positions():
         print(f"Error in api_positions: {e}")
         return jsonify({'positions': []})
 
+@app.route('/api/logs')
+def api_logs():
+    """Server-side event log stream with incremental polling support."""
+    try:
+        since_id = int(request.args.get('since_id', 0))
+        limit = int(request.args.get('limit', 100))
+        events = event_logger.get_events(since_id=since_id, limit=limit)
+        return jsonify({
+            'events': events,
+            'latest_id': event_logger.get_latest_id()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'events': []}), 500
+
+@app.route('/api/top_ranked')
+def api_top_ranked():
+    """Current top-ranked coins from the latest scoring cycle."""
+    try:
+        top_coins = global_state.get('top_coins', [])
+        # Build safe list (some coin detail values may not be JSON-safe)
+        ranked = []
+        for i, coin in enumerate(top_coins):
+            ranked.append({
+                'rank': i + 1,
+                'symbol': coin.get('symbol', ''),
+                'exchange': coin.get('exchange', 'binance'),
+                'final_score': float(coin.get('final_score', 0)),
+                'momentum_7d': float(coin.get('momentum_7d', 0)),
+                'momentum_24h': float(coin.get('momentum_24h', 0)),
+                'volatility': float(coin.get('volatility', 0)),
+                'trend_filter': int(coin.get('trend_filter', 0)),
+                'weight': float(coin.get('weight', 0)),
+            })
+        return jsonify({
+            'ranked': ranked,
+            'regime': global_state.get('regime', 'UNKNOWN'),
+            'total_scanned': len(global_state.get('top_coins', [])),
+            'last_update': global_state.get('last_slow_update')
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 def run_flask():
     app.run(host='0.0.0.0', port=5050, debug=False, use_reloader=False)
 
@@ -2148,6 +2361,7 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
+    event_logger.log('info', 'Alpha Prime v2 engine starting — 3-speed architecture active')
     print("\n🌐 Dashboard running at http://localhost:5050\n")
     time.sleep(2)
     
