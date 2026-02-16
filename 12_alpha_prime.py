@@ -2091,7 +2091,17 @@ DASHBOARD_HTML = """
 
             if (d.events && d.events.length > 0) {
                 d.events.forEach(e => {
-                    const ts = e.timestamp ? e.timestamp.split('T')[1].slice(0,8) : '--:--:--';
+                    // Convert server time (ISO) to Local Browser Time
+                    let ts = '--:--:--';
+                    if (e.timestamp) {
+                        try {
+                            const date = new Date(e.timestamp);
+                            ts = date.toLocaleTimeString([], { hour12: false });
+                        } catch(err) {
+                            ts = e.timestamp.split('T')[1].slice(0,8);
+                        }
+                    }
+
                     let logType = 'info';
                     if (e.type === 'buy') logType = 'buy';
                     else if (e.type === 'sell') logType = 'sell';

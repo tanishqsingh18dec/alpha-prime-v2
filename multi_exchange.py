@@ -96,7 +96,14 @@ class MultiExchangeScanner:
                     continue
                 if not markets[normalized_symbol].get('active', False):
                     continue
-                
+
+                # BLACKLIST: Filter out Leveraged Tokens (3L, 5L, UP, DOWN, BEAR, BULL)
+                base = normalized_symbol.split('/')[0]
+                if any(base.endswith(s) for s in ['3L', '3S', '5L', '5S', 'UP', 'DOWN', 'BEAR', 'BULL']):
+                    continue
+                if 'ETF' in base:  # Some exchanges label them as ETF
+                    continue
+
                 # Check volume threshold
                 if normalized_symbol in tickers:
                     ticker = tickers[normalized_symbol]
