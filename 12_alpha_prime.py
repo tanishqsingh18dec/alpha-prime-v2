@@ -662,7 +662,7 @@ class EventLogger:
             self._event_id += 1
             event = {
                 'id': self._event_id,
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.utcnow().isoformat() + 'Z',
                 'type': event_type,
                 'message': message,
                 'details': details or {}
