@@ -15,7 +15,7 @@ class MultiExchangeScanner:
     - Order execution routing
     """
     
-    def __init__(self, exchanges=['binance', 'kucoin', 'gateio', 'mexc']):
+    def __init__(self, exchanges=['binance', 'kucoin', 'gateio', 'mexc', 'bybit', 'kraken', 'bitget']):
         """
         Initialize scanner with specified exchanges.
         

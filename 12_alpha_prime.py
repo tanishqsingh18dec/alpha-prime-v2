@@ -38,7 +38,7 @@ MIN_COIN_VOLUME_24H = 1_000_000  # Lowered to $1M to catch more opportunities
 DISCORD_URL = ""              # Optional webhook
 
 # Multi-Exchange Configuration
-ENABLED_EXCHANGES = ['binance', 'kucoin', 'gateio', 'mexc']  # All 4 exchanges
+ENABLED_EXCHANGES = ['binance', 'kucoin', 'gateio', 'mexc', 'bybit', 'kraken', 'bitget']  # All 7 major exchanges
 
 # 3-Speed Architecture
 FAST_INTERVAL = 30      # 30 seconds - price observation
