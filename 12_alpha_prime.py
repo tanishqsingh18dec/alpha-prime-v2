@@ -434,7 +434,9 @@ class PortfolioAnalytics:
         btc_mean = np.mean(btc_returns)
         
         covariance = np.mean([(p - port_mean) * (b - btc_mean) for p, b in zip(portfolio_returns, btc_returns)])
-            beta = covariance / btc_variance if btc_variance > 0 else 0
+        btc_variance = np.var(btc_returns)
+        
+        beta = covariance / btc_variance if btc_variance > 0 else 0
         return beta
     
     def calculate_sharpe(self):
