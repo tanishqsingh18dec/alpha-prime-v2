@@ -798,14 +798,15 @@ class PaperPortfolio:
                 self.positions = data.get('positions', {})
                 self.total_trades = data.get('total_trades', 0)
                 self.winning_trades = data.get('winning_trades', 0)
-                self.total_pnl = data.get('total_pnl', 0.0)
+                # Fallback for old portfolio files
+                self.realized_pnl = data.get('realized_pnl', data.get('total_pnl', 0.0))
                 print(f"📂 Loaded portfolio: ${self.balance:.2f} balance, {len(self.positions)} positions")
         else:
             self.balance = STARTING_BALANCE
             self.positions = {}
             self.total_trades = 0
             self.winning_trades = 0
-            self.total_pnl = 0.0
+            self.realized_pnl = 0.0
             print(f"🆕 Starting fresh with ${STARTING_BALANCE}")
             self.save_portfolio()
     
@@ -816,7 +817,7 @@ class PaperPortfolio:
             'positions': self.positions,
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,
-            'total_pnl': self.total_pnl,
+            'realized_pnl': self.realized_pnl,
             'last_updated': datetime.now().isoformat()
         }
         with open(PORTFOLIO_FILE, 'w') as f:
