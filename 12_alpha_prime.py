@@ -434,21 +434,20 @@ class PortfolioAnalytics:
         btc_mean = np.mean(btc_returns)
         
         covariance = np.mean([(p - port_mean) * (b - btc_mean) for p, b in zip(portfolio_returns, btc_returns)])
-        btc_variance = np.var(btc_returns)
-        
-        beta = covariance / btc_variance if btc_variance > 0 else 0
+            beta = covariance / btc_variance if btc_variance > 0 else 0
         return beta
     
-    def calculate_sharpe_ratio(self, period_days=30):
-        """Sharpe Ratio: (Return - RiskFree) / Volatility"""
-        if len(self.equity_history) < 2:  # Adjusted for faster visibility
+    def calculate_sharpe(self):
+        """Sharpe Ratio: Risk-adjusted return"""
+        if len(self.equity_history) < 2:
             return 0
         
-        recent = self.equity_history[-period_days:]
+        # Use available data
+        points = self.equity_history[-288:] if len(self.equity_history) > 288 else self.equity_history
         returns = []
         
-        for i in range(1, len(recent)):
-            ret = (recent[i]['portfolio_value'] - recent[i-1]['portfolio_value']) / recent[i-1]['portfolio_value']
+        for i in range(1, len(points)):
+            ret = (points[i]['portfolio_value'] - points[i-1]['portfolio_value']) / points[i-1]['portfolio_value']
             returns.append(ret)
         
         if not returns:
@@ -465,45 +464,17 @@ class PortfolioAnalytics:
         
         return sharpe_annualized
     
-    def calculate_sortino_ratio(self, period_days=30):
-        """Sortino Ratio: Only penalize downside volatility"""
-        if len(self.equity_history) < 2:  # Adjusted for faster visibility
-            return 0
-        
-        recent = self.equity_history[-period_days:]
-        returns = []
-        
-        for i in range(1, len(recent)):
-            ret = (recent[i]['portfolio_value'] - recent[i-1]['portfolio_value']) / recent[i-1]['portfolio_value']
-            returns.append(ret)
-        
-        if not returns:
-            return 0
-        
-        avg_return = np.mean(returns)
-        downside_returns = [r for r in returns if r < 0]
-        
-        if not downside_returns:
-            return float('inf')  # No downside = infinite Sortino
-        
-        downside_std = np.std(downside_returns)
-        sortino = (avg_return / downside_std) if downside_std > 0 else 0
-        
-        # Annualize
-        sortino_annualized = sortino * np.sqrt(288 * 365)
-        
-        return sortino_annualized
-    
     def calculate_var_95(self):
         """Value at Risk (95% confidence, 24h)"""
-        if len(self.equity_history) < 5:  # Adjusted for faster visibility
+        if len(self.equity_history) < 2:
             return 0
         
-        recent = self.equity_history[-288:]  # Last 24h (5-min intervals)
+        # Use available data, up to last 288 points (24h)
+        recent = self.equity_history[-288:] if len(self.equity_history) > 288 else self.equity_history
         returns = []
         
-        for i in range(1, len(recent)):
-            ret = (recent[i]['portfolio_value'] - recent[i-1]['portfolio_value']) / recent[i-1]['portfolio_value']
+        for i in range(1, len(points)):
+            ret = (points[i]['portfolio_value'] - points[i-1]['portfolio_value']) / points[i-1]['portfolio_value']
             returns.append(ret)
         
         if not returns:
@@ -534,6 +505,33 @@ class PortfolioAnalytics:
         
         return max_dd * 100  # Return as percentage
     
+    def calculate_sortino(self):
+        """Calculate Sortino Ratio (downside risk only)"""
+        if len(self.equity_history) < 2:
+            return 0
+            
+        points = self.equity_history[-288:] if len(self.equity_history) > 288 else self.equity_history
+        returns = []
+        for i in range(1, len(points)):
+            ret = (points[i]['portfolio_value'] - points[i-1]['portfolio_value']) / points[i-1]['portfolio_value']
+            returns.append(ret)
+            
+        if not returns:
+            return 0
+            
+        mean_ret = np.mean(returns)
+        target_return = 0
+        downside_returns = [r - target_return for r in returns if r < target_return]
+        
+        if not downside_returns:
+            return float('inf')  # No downside risk
+            
+        downside_deviation = np.std(downside_returns)
+        if downside_deviation == 0:
+            return float('inf')
+            
+        return (mean_ret * 288) / (downside_deviation * np.sqrt(288))
+
     def get_exposure_breakdown(self):
         """Long/Short/Net exposure"""
         total_long = sum(pos['current_value'] for pos in self.portfolio.positions.values())
@@ -2190,7 +2188,7 @@ def api_hud():
         latency = execution_monitor.get_avg_latency() if execution_monitor else 0
         
         # Calculate realized and unrealized P&L
-        realized_pnl = portfolio.total_pnl if portfolio else 0  # From closed trades
+        realized_pnl = portfolio.realized_pnl if portfolio else 0  # From closed trades
         
         # Sum up unrealized P&L from all open positions
         unrealized_pnl = 0
@@ -2224,8 +2222,8 @@ def api_risk():
             return jsonify({'error': 'Analytics not initialized'}), 500
         
         return jsonify({
-            'sharpe_ratio': analytics.calculate_sharpe_ratio(),
-            'sortino_ratio': analytics.calculate_sortino_ratio(),
+            'sharpe_ratio': analytics.calculate_sharpe(),
+            'sortino_ratio': analytics.calculate_sortino(),
             'var_95': analytics.calculate_var_95(),
             'max_drawdown_pct': analytics.calculate_max_drawdown(),
             'exposure': analytics.get_exposure_breakdown()
