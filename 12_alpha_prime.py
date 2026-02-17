@@ -941,6 +941,7 @@ class PaperPortfolio:
         self.total_trades += 1
         if pnl > 0:
             self.winning_trades += 1
+        self.realized_pnl += pnl  # Update realized P&L
         
         self.log_trade('SELL', symbol, quantity, price, pnl=pnl, reason=f"{reason} | {exchange_name.upper()}")
         self.save_portfolio()
@@ -972,7 +973,7 @@ class PaperPortfolio:
         pnl = (price - entry_price) * trim_qty
         pnl_pct = (price - entry_price) / entry_price * 100
         
-        self.total_pnl += pnl
+        self.realized_pnl += pnl
         if pnl > 0:
             self.winning_trades += 0.25  # Partial win
         
