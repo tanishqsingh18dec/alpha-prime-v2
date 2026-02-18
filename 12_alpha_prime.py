@@ -1032,7 +1032,7 @@ class AlphaPrime:
         global_state['balance'] = self.portfolio.balance
         global_state['positions'] = self.portfolio.positions
         global_state['portfolio_value'] = self.portfolio.get_portfolio_value()
-        global_state['total_pnl'] = self.portfolio.total_pnl
+        global_state['realized_pnl'] = self.portfolio.realized_pnl
         global_state['last_fast_update'] = datetime.now().isoformat()
         
         # Emergency drawdown checks could go here
