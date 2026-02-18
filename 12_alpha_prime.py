@@ -24,8 +24,22 @@ import threading
 import time
 import json
 import os
+import pickle
+import warnings
 from pathlib import Path
 from multi_exchange import MultiExchangeScanner
+
+# ML imports for HMM and Portfolio Optimizer
+try:
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.preprocessing import StandardScaler
+    from scipy.optimize import minimize
+    HMM_AVAILABLE = True
+except ImportError:
+    HMM_AVAILABLE = False
+    print("⚠️  hmmlearn/scipy/sklearn not installed. Run: pip install hmmlearn scipy scikit-learn")
+
+warnings.filterwarnings('ignore')
 
 # =============================================================================
 # CONFIGURATION
@@ -70,7 +84,16 @@ global_state = {
     'total_pnl': 0.0,
     'last_slow_update': None,
     'last_medium_update': None,
-    'last_fast_update': None
+    'last_fast_update': None,
+    # HMM Regime Classifier
+    'hmm_regime': 'UNKNOWN',
+    'hmm_confidence': 0.0,
+    'hmm_state_history': [],   # list of {'timestamp', 'state'}
+    'hmm_trained': False,
+    # Portfolio Optimizer
+    'optimizer_weights': {},   # symbol -> weight
+    'optimizer_sharpe': 0.0,
+    'optimizer_active': False,
 }
 
 # =============================================================================
@@ -153,6 +176,206 @@ class RegimeDetector:
                 continue
         
         return above_ema / total if total > 0 else 0.5
+
+# =============================================================================
+# HMM MARKET REGIME CLASSIFIER  (Phase 1 Quant Upgrade)
+# =============================================================================
+
+class HMMRegimeClassifier:
+    """
+    Hidden Markov Model for market regime detection.
+
+    Features fed to the model:
+      - log_return   : daily log return of BTC
+      - realized_vol : 7-day rolling std of log returns
+
+    3 hidden states auto-labeled by mean return:
+      highest mean  → BULL
+      lowest mean   → BEAR
+      middle mean   → SIDEWAYS
+
+    Model is persisted to disk so it survives restarts.
+    Falls back to rule-based RegimeDetector if HMM unavailable.
+    """
+
+    MODEL_FILE = 'hmm_regime_model.pkl'
+    SCALER_FILE = 'hmm_scaler.pkl'
+
+    def __init__(self, n_states=3, train_symbol='BTC/USDT',
+                 train_timeframe='1d', train_limit=365):
+        self.n_states = n_states
+        self.train_symbol = train_symbol
+        self.train_timeframe = train_timeframe
+        self.train_limit = train_limit
+        self.model = None
+        self.scaler = None
+        self.state_labels = {}   # state_int -> 'BULL'|'BEAR'|'SIDEWAYS'
+        self.is_trained = False
+
+    # ------------------------------------------------------------------
+    def _fetch_training_data(self):
+        """Fetch OHLCV data for training. Returns DataFrame or None."""
+        try:
+            candles = exchange.fetch_ohlcv(
+                self.train_symbol, self.train_timeframe,
+                limit=self.train_limit
+            )
+            df = pd.DataFrame(
+                candles,
+                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+            )
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        except Exception as e:
+            print(f"   ⚠️  HMM: could not fetch training data: {e}")
+            return None
+
+    def _prepare_features(self, df):
+        """Build [log_return, realized_vol] feature matrix."""
+        df = df.copy()
+        df['log_return'] = np.log(df['close'] / df['close'].shift(1))
+        df['realized_vol'] = df['log_return'].rolling(7).std()
+        df = df.dropna()
+        return df[['log_return', 'realized_vol']].values, df
+
+    def _label_states(self, model, X):
+        """
+        Assign human labels to HMM states based on mean log return.
+        State with highest mean return → BULL
+        State with lowest mean return  → BEAR
+        Middle state                   → SIDEWAYS
+        """
+        state_seq = model.predict(X)
+        means = {}
+        for s in range(self.n_states):
+            mask = state_seq == s
+            if mask.sum() > 0:
+                means[s] = X[mask, 0].mean()   # mean log return
+            else:
+                means[s] = 0.0
+
+        sorted_states = sorted(means.keys(), key=lambda s: means[s])
+        labels = {}
+        labels[sorted_states[0]] = 'BEAR'
+        labels[sorted_states[-1]] = 'BULL'
+        for s in sorted_states[1:-1]:
+            labels[s] = 'SIDEWAYS'
+        return labels
+
+    # ------------------------------------------------------------------
+    def train(self):
+        """Train the GaussianHMM on historical BTC data and persist to disk."""
+        if not HMM_AVAILABLE:
+            print("   ⚠️  HMM: hmmlearn not available, skipping training")
+            return False
+
+        print("   🧠 HMM: Training on historical BTC data...")
+        df = self._fetch_training_data()
+        if df is None or len(df) < 60:
+            print("   ⚠️  HMM: insufficient data for training")
+            return False
+
+        X_raw, df_clean = self._prepare_features(df)
+
+        # Scale features
+        self.scaler = StandardScaler()
+        X = self.scaler.fit_transform(X_raw)
+
+        # Fit HMM
+        self.model = GaussianHMM(
+            n_components=self.n_states,
+            covariance_type='full',
+            n_iter=200,
+            random_state=42
+        )
+        self.model.fit(X)
+
+        # Label states
+        self.state_labels = self._label_states(self.model, X)
+        self.is_trained = True
+
+        # Persist
+        try:
+            with open(self.MODEL_FILE, 'wb') as f:
+                pickle.dump({'model': self.model,
+                             'scaler': self.scaler,
+                             'state_labels': self.state_labels}, f)
+            print(f"   ✅ HMM: Trained & saved. States: {self.state_labels}")
+        except Exception as e:
+            print(f"   ⚠️  HMM: could not save model: {e}")
+
+        return True
+
+    def load_or_train(self):
+        """Load model from disk if available, otherwise train fresh."""
+        if not HMM_AVAILABLE:
+            return
+
+        if os.path.exists(self.MODEL_FILE):
+            try:
+                with open(self.MODEL_FILE, 'rb') as f:
+                    data = pickle.load(f)
+                self.model = data['model']
+                self.scaler = data['scaler']
+                self.state_labels = data['state_labels']
+                self.is_trained = True
+                print(f"   📂 HMM: Loaded model from disk. States: {self.state_labels}")
+                return
+            except Exception as e:
+                print(f"   ⚠️  HMM: could not load model ({e}), retraining...")
+
+        self.train()
+
+    def retrain(self):
+        """Force retrain (called weekly or on demand)."""
+        self.train()
+
+    # ------------------------------------------------------------------
+    def predict(self, lookback_days=60):
+        """
+        Predict current market regime.
+
+        Returns:
+            regime      : 'BULL' | 'BEAR' | 'SIDEWAYS' | 'UNKNOWN'
+            confidence  : float 0-1 (posterior probability of predicted state)
+            history     : list of {'timestamp': str, 'state': str} for last lookback_days
+        """
+        if not self.is_trained or not HMM_AVAILABLE:
+            return 'UNKNOWN', 0.0, []
+
+        try:
+            df = self._fetch_training_data()
+            if df is None or len(df) < 30:
+                return 'UNKNOWN', 0.0, []
+
+            # Use recent data for prediction
+            df_recent = df.tail(lookback_days + 10)
+            X_raw, df_clean = self._prepare_features(df_recent)
+            X = self.scaler.transform(X_raw)
+
+            # Predict state sequence
+            state_seq = self.model.predict(X)
+            posteriors = self.model.predict_proba(X)
+
+            # Current state = last element
+            current_state_int = state_seq[-1]
+            current_regime = self.state_labels.get(current_state_int, 'UNKNOWN')
+            confidence = float(posteriors[-1, current_state_int])
+
+            # Build history
+            timestamps = df_clean['timestamp'].dt.strftime('%Y-%m-%dT%H:%M:%S').tolist()
+            history = [
+                {'timestamp': timestamps[i],
+                 'state': self.state_labels.get(state_seq[i], 'UNKNOWN')}
+                for i in range(len(state_seq))
+            ]
+
+            return current_regime, confidence, history
+
+        except Exception as e:
+            print(f"   ⚠️  HMM predict error: {e}")
+            return 'UNKNOWN', 0.0, []
+
 
 # =============================================================================
 # LAYER 2: UNIVERSE FILTER
@@ -317,6 +540,159 @@ class PositionSizer:
             coin['weight'] = weights[i]
         
         return top_coins
+
+# =============================================================================
+# PORTFOLIO OPTIMIZER — Max Sharpe (Mean-Variance)  (Phase 3 Quant Upgrade)
+# =============================================================================
+
+class PortfolioOptimizer:
+    """
+    Mean-Variance Portfolio Optimizer using Sharpe Ratio maximization.
+
+    Algorithm:
+      1. Fetch daily returns for each coin (lookback_days)
+      2. Compute expected return vector μ and covariance matrix Σ
+      3. Minimize  -(w·μ - rf) / sqrt(w·Σ·w)  subject to:
+           sum(w) = 1,  0 ≤ w ≤ MAX_POSITION_PCT
+      4. Return coins list with 'weight' key added
+
+    Falls back to PositionSizer (inverse volatility) when:
+      - hmmlearn/scipy not available
+      - Fewer than MIN_HISTORY_DAYS of data available
+      - Optimization fails to converge
+    """
+
+    MIN_HISTORY_DAYS = 14
+
+    def __init__(self, risk_free_rate=0.0):
+        self.risk_free_rate = risk_free_rate
+
+    def _fetch_returns(self, coins, lookback_days=30):
+        """
+        Fetch daily log returns for each coin.
+        Returns a DataFrame (days × coins) or None if insufficient data.
+        """
+        returns_dict = {}
+        for coin in coins:
+            symbol = coin['symbol']
+            exchange_name = coin.get('exchange', 'binance')
+            try:
+                candles = scanner.fetch_ohlcv(symbol, exchange_name, '1d',
+                                              limit=lookback_days + 5)
+                if len(candles) < self.MIN_HISTORY_DAYS:
+                    continue
+                df = pd.DataFrame(
+                    candles,
+                    columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                )
+                log_ret = np.log(df['close'] / df['close'].shift(1)).dropna()
+                returns_dict[symbol] = log_ret.values[-lookback_days:]
+            except Exception:
+                continue
+            time.sleep(0.05)
+
+        if len(returns_dict) < 2:
+            return None
+
+        # Align lengths
+        min_len = min(len(v) for v in returns_dict.values())
+        aligned = {k: v[-min_len:] for k, v in returns_dict.items()}
+        return pd.DataFrame(aligned)
+
+    def _neg_sharpe(self, weights, mu, cov):
+        """Objective: negative Sharpe ratio (we minimize this)."""
+        port_return = np.dot(weights, mu)
+        port_vol = np.sqrt(np.dot(weights, np.dot(cov, weights)))
+        if port_vol < 1e-10:
+            return 0.0
+        return -(port_return - self.risk_free_rate) / port_vol
+
+    def optimize(self, coins):
+        """
+        Compute optimal weights for the given list of coins.
+        Returns the same coins list with 'weight' key populated.
+        Falls back to PositionSizer on any failure.
+        """
+        if not HMM_AVAILABLE or len(coins) < 2:
+            return PositionSizer.calculate_weights(coins)
+
+        try:
+            returns_df = self._fetch_returns(coins)
+            if returns_df is None or len(returns_df) < self.MIN_HISTORY_DAYS:
+                print("   ⚠️  Optimizer: insufficient data, using inverse-vol fallback")
+                return PositionSizer.calculate_weights(coins)
+
+            # Only optimize coins we have data for
+            available_symbols = list(returns_df.columns)
+            opt_coins = [c for c in coins if c['symbol'] in available_symbols]
+            fallback_coins = [c for c in coins if c['symbol'] not in available_symbols]
+
+            mu = returns_df[available_symbols].mean().values          # expected returns
+            cov = returns_df[available_symbols].cov().values          # covariance matrix
+
+            n = len(available_symbols)
+            w0 = np.ones(n) / n   # equal-weight starting point
+
+            constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
+            bounds = [(0.0, MAX_POSITION_PCT)] * n
+
+            result = minimize(
+                self._neg_sharpe,
+                w0,
+                args=(mu, cov),
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 500, 'ftol': 1e-9}
+            )
+
+            if not result.success:
+                print(f"   ⚠️  Optimizer: did not converge ({result.message}), using inverse-vol")
+                return PositionSizer.calculate_weights(coins)
+
+            raw_weights = result.x
+            # Renormalize (in case of floating-point drift)
+            total_w = raw_weights.sum()
+            if total_w > 0:
+                raw_weights = raw_weights / total_w
+
+            # Assign weights back to coins
+            weight_map = dict(zip(available_symbols, raw_weights))
+            for coin in opt_coins:
+                coin['weight'] = float(weight_map[coin['symbol']])
+
+            # Fallback coins get equal share of remaining weight
+            if fallback_coins:
+                remaining = 1.0 - sum(c['weight'] for c in opt_coins)
+                per_coin = max(remaining / len(fallback_coins), 0.0)
+                for coin in fallback_coins:
+                    coin['weight'] = per_coin
+                # Renormalize everything
+                total = sum(c['weight'] for c in coins)
+                if total > 0:
+                    for coin in coins:
+                        coin['weight'] /= total
+
+            # Compute portfolio Sharpe for logging
+            w_arr = np.array([weight_map.get(s, 0) for s in available_symbols])
+            port_sharpe = -self._neg_sharpe(w_arr, mu, cov) * np.sqrt(252)
+
+            weight_str = ' | '.join(
+                f"{c['symbol'].split('/')[0]}={c['weight']:.1%}" for c in coins
+            )
+            print(f"   📐 OPTIMIZER: {weight_str} | Sharpe≈{port_sharpe:.2f}")
+            event_logger.log('info',
+                f'Portfolio Optimizer: {weight_str} | Annualized Sharpe≈{port_sharpe:.2f}',
+                {'weights': {c['symbol']: round(c['weight'], 4) for c in coins},
+                 'sharpe': round(port_sharpe, 4)}
+            )
+
+            return coins
+
+        except Exception as e:
+            print(f"   ⚠️  Optimizer error: {e}, using inverse-vol fallback")
+            return PositionSizer.calculate_weights(coins)
+
 
 # =============================================================================
 # ANALYTICS: Portfolio & Execution Monitoring
@@ -1012,6 +1388,16 @@ class AlphaPrime:
         self.analytics = PortfolioAnalytics(self.portfolio)
         self.execution_monitor = ExecutionMonitor()
         
+        # ── NEW: HMM Regime Classifier ──────────────────────────────────
+        self.hmm_classifier = HMMRegimeClassifier()
+        print("\n🧠 Initializing HMM Regime Classifier...")
+        self.hmm_classifier.load_or_train()
+        global_state['hmm_trained'] = self.hmm_classifier.is_trained
+        
+        # ── NEW: Portfolio Optimizer ─────────────────────────────────────
+        self.portfolio_optimizer = PortfolioOptimizer(risk_free_rate=0.0)
+        print("📐 Portfolio Optimizer (Max-Sharpe) ready")
+        
         # Store in global state for API access
         global_state['portfolio_obj'] = self.portfolio
         global_state['analytics'] = self.analytics
@@ -1072,30 +1458,54 @@ class AlphaPrime:
         print(f"🧠 ALPHA PRIME SLOW CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*80}")
         
-        # LAYER 1: Regime Detection
+        # LAYER 1: Regime Detection (Rule-Based + HMM)
         print("\n📊 LAYER 1: MARKET REGIME DETECTION")
+        
+        # --- Rule-Based Detector (existing, fast) ---
         regime, details = RegimeDetector.detect_regime()
         self.current_regime = regime
         self.regime_details = details
         
-        print(f"   Regime: {regime}")
+        print(f"   [Rule] Regime: {regime}")
         print(f"   BTC: ${details.get('btc_price', 0):.2f} vs EMA200 ${details.get('btc_ema200', 0):.2f} ({details.get('btc_vs_ema', 0):+.1f}%)")
         print(f"   Volatility: {details.get('volatility_30d', 0):.1%}")
         print(f"   Breadth: {details.get('breadth_pct', 0):.1%} above EMA50")
         
-        global_state['regime'] = regime
+        # --- HMM Classifier (ML, primary signal) ---
+        hmm_regime, hmm_confidence, hmm_history = self.hmm_classifier.predict()
+        
+        # Map HMM labels to execution logic
+        # BULL → RISK_ON, BEAR → RISK_OFF, SIDEWAYS → CHOP
+        hmm_to_rule = {'BULL': 'RISK_ON', 'BEAR': 'RISK_OFF', 'SIDEWAYS': 'CHOP', 'UNKNOWN': regime}
+        hmm_rule_equiv = hmm_to_rule.get(hmm_regime, regime)
+        
+        if hmm_regime != 'UNKNOWN':
+            print(f"   [HMM]  Regime: {hmm_regime} (confidence: {hmm_confidence:.1%})")
+            # HMM is primary; rule-based is fallback
+            effective_regime = hmm_rule_equiv
+        else:
+            print(f"   [HMM]  Not available — using rule-based regime")
+            effective_regime = regime
+        
+        # Update global state with both signals
+        global_state['regime'] = effective_regime
         global_state['regime_details'] = details
+        global_state['hmm_regime'] = hmm_regime
+        global_state['hmm_confidence'] = hmm_confidence
+        global_state['hmm_state_history'] = hmm_history[-30:] if hmm_history else []
         
-        event_logger.log('regime', f'Regime: {regime} | BTC: ${details.get("btc_price", 0):.0f} vs EMA200 ${details.get("btc_ema200", 0):.0f} | Breadth: {details.get("breadth_pct", 0):.0%}', {
-            'regime': regime, 'btc_price': details.get('btc_price', 0), 'btc_ema200': details.get('btc_ema200', 0)
-        })
+        event_logger.log('regime',
+            f'Regime: {effective_regime} | HMM: {hmm_regime} ({hmm_confidence:.0%} conf) | Rule: {regime} | BTC: ${details.get("btc_price", 0):.0f}',
+            {'regime': effective_regime, 'hmm_regime': hmm_regime, 'hmm_confidence': hmm_confidence,
+             'rule_regime': regime, 'btc_price': details.get('btc_price', 0)}
+        )
         
-        # If Risk-Off, exit everything
-        if regime == 'RISK_OFF':
-            print("   ⚠️  RISK-OFF DETECTED → EXITING ALL POSITIONS")
-            event_logger.log('warn', 'RISK-OFF DETECTED — exiting all positions')
+        # Strategy switching based on effective regime
+        if effective_regime == 'RISK_OFF':
+            print("   ⚠️  RISK-OFF / BEAR DETECTED → EXITING ALL POSITIONS (holding cash)")
+            event_logger.log('warn', f'BEAR/RISK-OFF regime — exiting all positions')
             for symbol in list(self.portfolio.positions.keys()):
-                self.portfolio.execute_sell(symbol, "Risk-Off Regime")
+                self.portfolio.execute_sell(symbol, f"Bear Regime ({hmm_regime})")
             return
         
         # LAYER 2: Universe Filter
@@ -1129,17 +1539,29 @@ class AlphaPrime:
         for coin in top_n:
             event_logger.log('signal', f'RANKED #{top_n.index(coin)+1}: {coin["symbol"]} | Score: {coin["final_score"]:.4f} | Mom7d: {coin["momentum_7d"]:.1%} | {coin.get("exchange","binance").upper()}')
         
-        # LAYER 4: Position Sizing
-        print("\n💰 LAYER 4: POSITION SIZING (Inverse Volatility)")
-        top_n_weighted = PositionSizer.calculate_weights(top_n)
+        # LAYER 4: Position Sizing (Portfolio Optimizer → Inverse-Vol fallback)
+        print("\n💰 LAYER 4: POSITION SIZING (Max-Sharpe Optimizer)")
+        
+        # In SIDEWAYS regime: reduce position count to avoid chop
+        if effective_regime == 'CHOP':
+            sideways_n = max(1, TOP_N_POSITIONS // 2)
+            print(f"   ⚠️  SIDEWAYS regime → reducing to top {sideways_n} positions")
+            top_n = top_n[:sideways_n]
+        
+        top_n_weighted = self.portfolio_optimizer.optimize(top_n)
         
         for coin in top_n_weighted:
             print(f"   {coin['symbol']:<12} → {coin['weight']:>6.1%}")
         
-        # Apply regime multiplier
-        regime_multiplier = 1.0 if regime == 'RISK_ON' else 0.5
+        # Update optimizer state in global
+        global_state['optimizer_weights'] = {c['symbol']: round(c['weight'], 4) for c in top_n_weighted}
+        global_state['optimizer_active'] = HMM_AVAILABLE
+        
+        # Apply regime multiplier to position sizes
+        # RISK_ON = full size, CHOP = 50% size
+        regime_multiplier = 1.0 if effective_regime == 'RISK_ON' else 0.5
         if regime_multiplier != 1.0:
-            print(f"   ⚠️  Regime: {regime} → Reducing size by {(1-regime_multiplier)*100:.0f}%")
+            print(f"   ⚠️  Regime: {effective_regime} → Reducing position size by {(1-regime_multiplier)*100:.0f}%")
             for coin in top_n_weighted:
                 coin['weight'] *= regime_multiplier
         
@@ -1534,6 +1956,7 @@ DASHBOARD_HTML = """
         .regime-risk-on { background: var(--green-muted); color: var(--green); }
         .regime-risk-off { background: var(--red-muted); color: var(--red); }
         .regime-unknown { background: var(--yellow-muted); color: var(--yellow); }
+        .regime-chop { background: var(--blue-muted); color: var(--blue); }
 
         /* ─── NO DATA STATE ─── */
         .no-data {
@@ -1575,7 +1998,12 @@ DASHBOARD_HTML = """
             <div class="hud-value" id="hudBeta">0.00</div>
         </div>
         <div class="hud-item">
-            <div class="hud-label">Regime</div>
+            <div class="hud-label">HMM Regime</div>
+            <div id="hudHmmRegime"><span class="badge-regime regime-unknown">UNKNOWN</span></div>
+            <div class="hud-sub" id="hudHmmConf">—</div>
+        </div>
+        <div class="hud-item">
+            <div class="hud-label">Rule Regime</div>
             <div id="hudRegime"><span class="badge-regime regime-unknown">UNKNOWN</span></div>
         </div>
         <div class="hud-item">
@@ -1895,6 +2323,18 @@ DASHBOARD_HTML = """
             else if (regime === 'RISK_OFF') regimeClass = 'regime-risk-off';
             regimeEl.innerHTML = '<span class="badge-regime ' + regimeClass + '">' + regime + '</span>';
 
+            // HMM Regime
+            const hmmRegimeEl = document.getElementById('hudHmmRegime');
+            const hmmConfEl = document.getElementById('hudHmmConf');
+            const hmmRegime = d.hmm_regime || 'UNKNOWN';
+            const hmmConf = d.hmm_confidence || 0;
+            let hmmClass = 'regime-unknown';
+            if (hmmRegime === 'BULL') hmmClass = 'regime-risk-on';
+            else if (hmmRegime === 'BEAR') hmmClass = 'regime-risk-off';
+            else if (hmmRegime === 'SIDEWAYS') hmmClass = 'regime-chop';
+            hmmRegimeEl.innerHTML = '<span class="badge-regime ' + hmmClass + '">' + hmmRegime + '</span>';
+            hmmConfEl.textContent = hmmRegime !== 'UNKNOWN' ? (hmmConf * 100).toFixed(0) + '% conf' : '—';
+
             const lat = d.api_latency_ms;
             const latEl = document.getElementById('hudLatency');
             latEl.textContent = lat.toFixed(0) + 'ms';
@@ -2167,7 +2607,15 @@ def api_state():
         'top_ranked': global_state.get('top_ranked', []),
         'last_slow_update': global_state.get('last_slow_update'),
         'last_medium_update': global_state.get('last_medium_update'),
-        'last_fast_update': global_state.get('last_fast_update')
+        'last_fast_update': global_state.get('last_fast_update'),
+        # HMM Regime Classifier
+        'hmm_regime': global_state.get('hmm_regime', 'UNKNOWN'),
+        'hmm_confidence': global_state.get('hmm_confidence', 0.0),
+        'hmm_state_history': global_state.get('hmm_state_history', []),
+        'hmm_trained': global_state.get('hmm_trained', False),
+        # Portfolio Optimizer
+        'optimizer_weights': global_state.get('optimizer_weights', {}),
+        'optimizer_active': global_state.get('optimizer_active', False),
     }
     return jsonify(safe_state)
 
@@ -2209,7 +2657,14 @@ def api_hud():
             'api_latency_ms': latency,
             'connection_status': 'CONNECTED',
             'realized_pnl': realized_pnl,
-            'unrealized_pnl': unrealized_pnl
+            'unrealized_pnl': unrealized_pnl,
+            # HMM fields
+            'hmm_regime': global_state.get('hmm_regime', 'UNKNOWN'),
+            'hmm_confidence': global_state.get('hmm_confidence', 0.0),
+            'hmm_trained': global_state.get('hmm_trained', False),
+            # Optimizer fields
+            'optimizer_weights': global_state.get('optimizer_weights', {}),
+            'optimizer_active': global_state.get('optimizer_active', False),
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
