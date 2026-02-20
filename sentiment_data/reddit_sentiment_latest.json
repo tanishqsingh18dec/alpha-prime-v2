@@ -1,0 +1,92 @@
+{
+  "UNI": {
+    "sentiment": 0.2667,
+    "posts_analyzed": 1,
+    "total_upvotes": 2,
+    "signal": "BULLISH"
+  },
+  "DOGE": {
+    "sentiment": 0.2185,
+    "posts_analyzed": 3,
+    "total_upvotes": 6,
+    "signal": "BULLISH"
+  },
+  "CRO": {
+    "sentiment": 0.1875,
+    "posts_analyzed": 8,
+    "total_upvotes": 42,
+    "signal": "BULLISH"
+  },
+  "ADA": {
+    "sentiment": 0.1779,
+    "posts_analyzed": 4,
+    "total_upvotes": 42,
+    "signal": "BULLISH"
+  },
+  "SHIB": {
+    "sentiment": 0.1462,
+    "posts_analyzed": 2,
+    "total_upvotes": 13,
+    "signal": "BULLISH"
+  },
+  "MARKET": {
+    "sentiment": 0.0947,
+    "posts_analyzed": 51,
+    "total_upvotes": 300,
+    "signal": "NEUTRAL"
+  },
+  "BTC": {
+    "sentiment": 0.0337,
+    "posts_analyzed": 30,
+    "total_upvotes": 483,
+    "signal": "NEUTRAL"
+  },
+  "LTC": {
+    "sentiment": 0.0,
+    "posts_analyzed": 1,
+    "total_upvotes": 0,
+    "signal": "NEUTRAL"
+  },
+  "MATIC": {
+    "sentiment": 0.0,
+    "posts_analyzed": 1,
+    "total_upvotes": 1,
+    "signal": "NEUTRAL"
+  },
+  "MIOTA": {
+    "sentiment": 0.0,
+    "posts_analyzed": 1,
+    "total_upvotes": 1,
+    "signal": "NEUTRAL"
+  },
+  "XNO": {
+    "sentiment": 0.0,
+    "posts_analyzed": 1,
+    "total_upvotes": 17,
+    "signal": "NEUTRAL"
+  },
+  "XMR": {
+    "sentiment": -0.0267,
+    "posts_analyzed": 3,
+    "total_upvotes": 65,
+    "signal": "NEUTRAL"
+  },
+  "ETH": {
+    "sentiment": -0.0882,
+    "posts_analyzed": 15,
+    "total_upvotes": 112,
+    "signal": "NEUTRAL"
+  },
+  "SOL": {
+    "sentiment": -0.76,
+    "posts_analyzed": 1,
+    "total_upvotes": 3,
+    "signal": "BEARISH"
+  },
+  "_meta": {
+    "date": "2026-02-20",
+    "timestamp": "2026-02-20T20:20:44.600960",
+    "subreddits_scraped": 50,
+    "total_posts": 122
+  }
+}

@@ -410,77 +410,220 @@ class UniverseFilter:
             return []
 
 # =============================================================================
-# LAYER 3: ALPHA SCORE ENGINE (Volatility-Adjusted Momentum)
+# SENTIMENT LOADER  (reads output from reddit_sentiment.py)
+# =============================================================================
+
+class SentimentLoader:
+    """
+    Loads the latest Reddit sentiment scores from reddit_sentiment_latest.json.
+    Provides:
+      get(symbol)             → float [-1, +1]  (subreddit-level sentiment)
+      get_signal(symbol)      → 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+      get_verdict(symbol)     → 'SHOOT_UP' | 'SHOOT_DOWN' | 'WATCH' | 'LOW_DATA'
+      get_confidence(symbol)  → 'HIGH' | 'MEDIUM' | 'LOW'
+      get_mention_count(symbol) → int
+      get_verdict_bonus(symbol) → float  (±0.1 bonus applied to alpha score)
+
+    Cached in memory — call refresh() to reload from disk.
+    """
+
+    SENTIMENT_FILE = os.path.join('sentiment_data', 'reddit_sentiment_latest.json')
+
+    def __init__(self):
+        self._data = {}
+        self.refresh()
+
+    def refresh(self):
+        """Reload sentiment data from disk."""
+        try:
+            if os.path.exists(self.SENTIMENT_FILE):
+                with open(self.SENTIMENT_FILE, 'r') as f:
+                    self._data = json.load(f)
+                meta = self._data.get('_meta', {})
+                coins_tracked = meta.get('coins_tracked', '?')
+                print(f"   📰 Sentiment v{meta.get('version','?')} loaded: "
+                      f"{meta.get('total_posts','?')} posts · "
+                      f"{coins_tracked} coins tracked · {meta.get('date','?')}")
+                # Print holdings correlation if available
+                hc = self._data.get('_holdings_correlation', {})
+                if hc.get('holdings'):
+                    print(f"   🔗 Holdings correlation: {len(hc['holdings'])} positions · "
+                          f"Market: {hc.get('market_overall','?')}")
+                    for sym, info in hc['holdings'].items():
+                        print(f"      {sym:<16} {info['recommendation']}")
+            else:
+                print("   ⚠️  Sentiment file not found — running without sentiment signal")
+                self._data = {}
+        except Exception as e:
+            print(f"   ⚠️  Sentiment load error: {e}")
+            self._data = {}
+
+    def _entry(self, symbol: str) -> dict:
+        """Internal: get the raw entry for a symbol."""
+        base = symbol.split('/')[0].upper()  # 'SOL/USDT' → 'SOL'
+        return self._data.get(base, {})
+
+    def get(self, symbol: str) -> float:
+        """
+        Get sentiment score for a coin symbol (e.g. 'SOL/USDT' or 'SOL').
+        Returns float in [-1.0, +1.0]. 0.0 = neutral / not found.
+        """
+        return float(self._entry(symbol).get('sentiment', 0.0))
+
+    def get_signal(self, symbol: str) -> str:
+        """Returns 'BULLISH', 'BEARISH', or 'NEUTRAL'."""
+        return self._entry(symbol).get('signal', 'NEUTRAL')
+
+    def get_verdict(self, symbol: str) -> str:
+        """Returns cross-subreddit verdict: 'SHOOT_UP' | 'SHOOT_DOWN' | 'WATCH' | 'LOW_DATA'."""
+        return self._entry(symbol).get('verdict', 'LOW_DATA')
+
+    def get_confidence(self, symbol: str) -> str:
+        """Returns verdict confidence: 'HIGH' | 'MEDIUM' | 'LOW'."""
+        return self._entry(symbol).get('confidence', 'LOW')
+
+    def get_mention_count(self, symbol: str) -> int:
+        """Total number of times this coin was mentioned across all subreddits today."""
+        return int(self._entry(symbol).get('mention_count', 0))
+
+    def get_verdict_bonus(self, symbol: str) -> float:
+        """
+        Returns a small bonus/penalty to add on top of the alpha score:
+          +0.10 if SHOOT_UP  with HIGH or MEDIUM confidence
+          +0.05 if SHOOT_UP  with LOW confidence
+          -0.10 if SHOOT_DOWN with HIGH or MEDIUM confidence
+          -0.05 if SHOOT_DOWN with LOW confidence
+           0.00 otherwise (WATCH / LOW_DATA)
+        """
+        verdict    = self.get_verdict(symbol)
+        confidence = self.get_confidence(symbol)
+
+        if verdict == 'SHOOT_UP':
+            return 0.10 if confidence in ('HIGH', 'MEDIUM') else 0.05
+        elif verdict == 'SHOOT_DOWN':
+            return -0.10 if confidence in ('HIGH', 'MEDIUM') else -0.05
+        return 0.0
+
+    def get_holdings_correlation(self) -> dict:
+        """Return the raw holdings correlation block from the JSON."""
+        return self._data.get('_holdings_correlation', {})
+
+
+# Global sentiment loader instance (refreshed each slow cycle)
+sentiment_loader = SentimentLoader()
+
+# =============================================================================
+# LAYER 3: ALPHA SCORE ENGINE (Volatility-Adjusted Momentum + Sentiment)
 # =============================================================================
 
 class AlphaScorer:
     """
-    Cross-sectional momentum with volatility adjustment.
+    Cross-sectional momentum with volatility adjustment + Reddit sentiment blend.
     """
-    
+
+    # Blending weights: how much each signal contributes to the final score
+    MOMENTUM_WEIGHT  = 0.80   # 80% price-based momentum
+    SENTIMENT_WEIGHT = 0.20   # 20% Reddit crowd sentiment
+
     @staticmethod
     def calculate_score(coin_data):
         """
-        Calculate volatility-adjusted momentum score for a coin.
-        Now exchange-aware - fetches data from correct exchange.
-        
+        Calculate volatility-adjusted momentum score for a coin,
+        blended with Reddit sentiment.
+
         Formula:
-        RawScore = 0.6 * Momentum_7d + 0.4 * Momentum_24h
-        RiskAdjScore = RawScore / Volatility
-        FinalScore = RiskAdjScore * TrendFilter
+          RawMomentum     = 0.6 * Momentum_7d + 0.4 * Momentum_24h
+          RiskAdjMomentum = RawMomentum / Volatility
+          MomentumScore   = RiskAdjMomentum * TrendFilter
+
+          SentimentScore  = reddit_sentiment[-1, +1]  (from SentimentLoader)
+
+          FinalScore = 0.80 * MomentumScore + 0.20 * SentimentScore
+
+        If sentiment data is unavailable, SentimentScore = 0 (neutral),
+        so the formula degrades gracefully to pure momentum.
         """
         try:
             symbol = coin_data['symbol']
             exchange_name = coin_data['exchange']
-            
+
             # Fetch 30 days of daily data for momentum + volatility
             candles = scanner.fetch_ohlcv(symbol, exchange_name, '1d', limit=30)
             if len(candles) < 30:
                 return None, None
-            
+
             df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
+
             current_price = df['close'].iloc[-1]
-            price_7d_ago = df['close'].iloc[-8]
-            price_1d_ago = df['close'].iloc[-2]
-            
+            price_7d_ago  = df['close'].iloc[-8]
+            price_1d_ago  = df['close'].iloc[-2]
+
             # Momentum calculations
-            momentum_7d = (current_price - price_7d_ago) / price_7d_ago
+            momentum_7d  = (current_price - price_7d_ago) / price_7d_ago
             momentum_24h = (current_price - price_1d_ago) / price_1d_ago
-            
+
             # Volatility (30-day stddev of log returns)
             log_returns = np.log(df['close'] / df['close'].shift(1)).dropna()
-            volatility = log_returns.std()
-            
+            volatility  = log_returns.std()
+
             if volatility == 0:
                 return None, None
-            
+
             # Trend filter: EMA 50 on 4H
             candles_4h = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
-            df_4h = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            ema_50 = df_4h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+            df_4h      = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            ema_50     = df_4h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
             trend_filter = 1 if current_price > ema_50 else 0
-            
-            # Score calculation
-            raw_score = 0.6 * momentum_7d + 0.4 * momentum_24h
+
+            # ── Momentum score (price-based) ──────────────────────────────
+            raw_score      = 0.6 * momentum_7d + 0.4 * momentum_24h
             risk_adj_score = raw_score / volatility
-            final_score = risk_adj_score * trend_filter
-            
+            momentum_score = risk_adj_score * trend_filter
+
+            # ── Sentiment score (Reddit crowd signal) ─────────────────────
+            sentiment_score   = sentiment_loader.get(symbol)          # [-1, +1]
+            sentiment_signal  = sentiment_loader.get_signal(symbol)
+            verdict           = sentiment_loader.get_verdict(symbol)  # SHOOT_UP / DOWN / WATCH
+            verdict_confidence= sentiment_loader.get_confidence(symbol)
+            mention_count     = sentiment_loader.get_mention_count(symbol)
+            verdict_bonus     = sentiment_loader.get_verdict_bonus(symbol)
+
+            # ── Blended final score ───────────────────────────────────────
+            # If trend filter is OFF (price below EMA50), kill the whole score
+            # regardless of sentiment — we don't fight a downtrend.
+            if trend_filter == 0:
+                final_score = 0.0
+            else:
+                base_score = (
+                    AlphaScorer.MOMENTUM_WEIGHT  * momentum_score +
+                    AlphaScorer.SENTIMENT_WEIGHT * sentiment_score
+                )
+                # Apply verdict bonus: SHOOT_UP/DOWN at HIGH/MEDIUM confidence
+                # nudges the score without overriding momentum signal.
+                final_score = base_score + verdict_bonus
+
             details = {
-                'symbol': symbol,
-                'exchange': exchange_name,  # Track which exchange
-                'price': current_price,
-                'momentum_7d': momentum_7d,
-                'momentum_24h': momentum_24h,
-                'volatility': volatility,
-                'ema_50': ema_50,
-                'trend_filter': trend_filter,
-                'raw_score': raw_score,
-                'final_score': final_score
+                'symbol':              symbol,
+                'exchange':            exchange_name,
+                'price':               current_price,
+                'momentum_7d':         momentum_7d,
+                'momentum_24h':        momentum_24h,
+                'volatility':          volatility,
+                'ema_50':              ema_50,
+                'trend_filter':        trend_filter,
+                'raw_score':           raw_score,
+                'momentum_score':      momentum_score,
+                'sentiment_score':     sentiment_score,
+                'sentiment_signal':    sentiment_signal,
+                'reddit_verdict':      verdict,
+                'verdict_confidence':  verdict_confidence,
+                'reddit_mentions':     mention_count,
+                'verdict_bonus':       verdict_bonus,
+                'final_score':         final_score
             }
-            
+
             return final_score, details
-            
+
         except Exception as e:
             return None, None
     
@@ -1457,7 +1600,11 @@ class AlphaPrime:
         print(f"\n{'='*80}")
         print(f"🧠 ALPHA PRIME SLOW CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*80}")
-        
+
+        # Refresh Reddit sentiment data from disk (updated daily by reddit_sentiment.py)
+        print("\n📰 REFRESHING SENTIMENT DATA")
+        sentiment_loader.refresh()
+
         # LAYER 1: Regime Detection (Rule-Based + HMM)
         print("\n📊 LAYER 1: MARKET REGIME DETECTION")
         
