@@ -57,6 +57,7 @@ POSITIONS_BY_REGIME = {
     'UNKNOWN':  2,   # No signal    — conservative, max 2 coins
 }
 MAX_POSITION_PCT = 0.40       # Max 40% in one position
+TARGET_INVESTMENT_PCT = 0.90  # Deploy up to 90% of portfolio; keep 10% as cash buffer
 MIN_COIN_VOLUME_24H = 1_000_000  # Lowered to $1M to catch more opportunities
 DISCORD_URL = ""              # Optional webhook
 
@@ -1408,19 +1409,23 @@ class PaperPortfolio:
         """Execute buy order (exchange-aware)"""
         if symbol in self.positions:
             return False
-        
-        exchange_name = details.get('exchange', 'binance')  # Get exchange from details
+
+        exchange_name = details.get('exchange', 'binance')
         price = self.get_current_price(symbol, exchange_name)
         if not price:
             return False
-        
-        # Calculate position size
+
+        # Calculate position size:
+        # Each coin gets (weight × TARGET_INVESTMENT_PCT) of total portfolio value.
+        # This guarantees we deploy TARGET_INVESTMENT_PCT in total, not whatever
+        # the optimizer happened to sum to after renormalization + old multipliers.
         portfolio_value = self.get_portfolio_value()
-        position_value = portfolio_value * weight
-        
+        position_value  = portfolio_value * weight * TARGET_INVESTMENT_PCT
+
+        # Safety: never spend more than we actually have
         if self.balance < position_value:
-            position_value = self.balance * 0.95  # Use 95% of available
-        
+            position_value = self.balance * 0.95
+
         if position_value < 5:
             return False
         
@@ -1709,13 +1714,8 @@ class AlphaPrime:
         global_state['optimizer_weights'] = {c['symbol']: round(c['weight'], 4) for c in top_n_weighted}
         global_state['optimizer_active'] = HMM_AVAILABLE
         
-        # Apply regime multiplier to position sizes
-        # RISK_ON = full size, CHOP = 50% size
-        regime_multiplier = 1.0 if effective_regime == 'RISK_ON' else 0.5
-        if regime_multiplier != 1.0:
-            print(f"   ⚠️  Regime: {effective_regime} → Reducing position size by {(1-regime_multiplier)*100:.0f}%")
-            for coin in top_n_weighted:
-                coin['weight'] *= regime_multiplier
+        # Position count already controls regime risk — no need to also cut weights.
+        # (Regime multiplier removed: it was causing ~70% of capital to idle in cash)
         
         # LAYER 5: Execution - Rotation
         print("\n🔄 LAYER 5: CAPITAL ROTATION")
