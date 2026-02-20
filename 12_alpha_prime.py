@@ -51,10 +51,10 @@ STARTING_BALANCE = 100.0
 # Uncertain/chop  → trim down, preserve capital
 # Bearish/risk-off → cash only (handled by early return in slow_loop)
 POSITIONS_BY_REGIME = {
-    'RISK_ON':  8,   # Bull market  — hold up to 8 coins
-    'CHOP':     3,   # Sideways     — hold up to 3 coins
-    'RISK_OFF': 0,   # Bear market  — exit all, hold cash
-    'UNKNOWN':  2,   # No signal    — conservative, max 2 coins
+    'RISK_ON':  10,   # Bull market  — hold up to 8 coins
+    'CHOP':     4,   # Sideways     — hold up to 3 coins
+    'RISK_OFF': 1,   # Bear market  — exit all, hold cash
+    'UNKNOWN':  5,   # No signal    — conservative, max 2 coins
 }
 MAX_POSITION_PCT = 0.40       # Max 40% in one position
 TARGET_INVESTMENT_PCT = 0.90  # Deploy up to 90% of portfolio; keep 10% as cash buffer
