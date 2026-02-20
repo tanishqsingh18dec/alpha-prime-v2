@@ -46,7 +46,16 @@ warnings.filterwarnings('ignore')
 # =============================================================================
 
 STARTING_BALANCE = 100.0
-TOP_N_POSITIONS = 5           # Hold top 5 ranked coins
+# Dynamic position count by market regime
+# Bullish market  → more bets, spread the alpha
+# Uncertain/chop  → trim down, preserve capital
+# Bearish/risk-off → cash only (handled by early return in slow_loop)
+POSITIONS_BY_REGIME = {
+    'RISK_ON':  8,   # Bull market  — hold up to 8 coins
+    'CHOP':     3,   # Sideways     — hold up to 3 coins
+    'RISK_OFF': 0,   # Bear market  — exit all, hold cash
+    'UNKNOWN':  2,   # No signal    — conservative, max 2 coins
+}
 MAX_POSITION_PCT = 0.40       # Max 40% in one position
 MIN_COIN_VOLUME_24H = 1_000_000  # Lowered to $1M to catch more opportunities
 DISCORD_URL = ""              # Optional webhook
@@ -1669,32 +1678,28 @@ class AlphaPrime:
             print("   ⚠️  No coins to rank")
             return
         
-        # Select Top N
-        top_n = ranked[:TOP_N_POSITIONS]
+        # ── Dynamic position count based on regime ─────────────────────────
+        active_n = POSITIONS_BY_REGIME.get(effective_regime, 2)
+        top_n = ranked[:active_n]
         self.top_ranked = top_n
-        
-        print(f"\n   🏆 TOP {TOP_N_POSITIONS} RANKED COINS:")
+
+        print(f"\n   🏆 TOP {active_n} RANKED COINS (regime: {effective_regime}):")
         print(f"   {'Coin':<12} {'Score':<10} {'Mom7d':<8} {'Mom24h':<8} {'Vol':<8} {'Trend'}")
         print(f"   {'-'*70}")
         for coin in top_n:
             trend_status = "✅" if coin['trend_filter'] == 1 else "❌"
             print(f"   {coin['symbol']:<12} {coin['final_score']:>9.4f} {coin['momentum_7d']:>7.1%} {coin['momentum_24h']:>7.1%} {coin['volatility']:>7.4f} {trend_status}")
-        
+
         global_state['top_coins'] = top_n
-        
+
         # Log top coins as signal events
         for coin in top_n:
             event_logger.log('signal', f'RANKED #{top_n.index(coin)+1}: {coin["symbol"]} | Score: {coin["final_score"]:.4f} | Mom7d: {coin["momentum_7d"]:.1%} | {coin.get("exchange","binance").upper()}')
-        
+
         # LAYER 4: Position Sizing (Portfolio Optimizer → Inverse-Vol fallback)
         print("\n💰 LAYER 4: POSITION SIZING (Max-Sharpe Optimizer)")
-        
-        # In SIDEWAYS regime: reduce position count to avoid chop
-        if effective_regime == 'CHOP':
-            sideways_n = max(1, TOP_N_POSITIONS // 2)
-            print(f"   ⚠️  SIDEWAYS regime → reducing to top {sideways_n} positions")
-            top_n = top_n[:sideways_n]
-        
+
+        # No additional regime slicing needed — active_n already accounts for regime
         top_n_weighted = self.portfolio_optimizer.optimize(top_n)
         
         for coin in top_n_weighted:
