@@ -71,7 +71,12 @@ SLOW_INTERVAL = 1800    # 30 minutes - full rebalance
 
 # Exit thresholds
 RSI_TRIM_THRESHOLD = 80       # Trim when RSI > 80
-TRIM_PERCENTAGE = 0.25        # Trim 25% of position
+RSI_EXTREME_THRESHOLD = 85    # Heavy trim when RSI > 85 (extreme overbought)
+TRIM_PERCENTAGE = 0.25        # Standard trim: 25% of position
+HEAVY_TRIM_PERCENTAGE = 0.50  # Heavy trim: 50% of position (extreme overbought)
+TRAILING_STOP_TRIGGER = 0.10  # Activate trailing stop after 10% gain
+TRAILING_STOP_PCT = 0.07      # Trail 7% below the all-time high for this position
+HARD_STOP_LOSS_PCT = -0.05    # Hard stop loss at -5%
 TIME_STOP_CYCLES = 3          # Exit if no movement after N slow cycles
 MIN_RETURN_TO_HOLD = 0.02     # 2% minimum return to keep holding
 
@@ -1239,72 +1244,98 @@ class ExecutionEngine:
         """
         Check if position should be exited.
         Returns: (should_exit, reason)
-        
+
         Exit conditions:
-        - Price < EMA 50 (4H close) → KILL
-        - Time stop: held for N cycles with low return
+        1. Hard Stop Loss: -5% from entry  → immediate exit
+        2. Trailing Stop: 7% drop from peak (only active after 10% gain)
+        3. Trend Kill: price < 4H EMA 50
+        4. Time Stop: held N cycles with insufficient return
         """
         try:
             # Fetch 4H data for EMA50
             candles_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
             df = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
+
             current_price = df['close'].iloc[-1]
-            ema_50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-            
-            # Exit A: Trend Kill
-            if current_price < ema_50:
-                return True, "Trend Kill (< EMA50)"
-            
-            # Exit C: Time Stop
-            cycles_held = position.get('cycles_held', 0)
             entry_price = position['entry_price']
             pnl_pct = (current_price - entry_price) / entry_price
-            
+
+            # --- Exit 1: HARD STOP LOSS ---
+            if pnl_pct < HARD_STOP_LOSS_PCT:
+                return True, f"Hard Stop Loss ({pnl_pct*100:.1f}%)"
+
+            # --- Exit 2: TRAILING STOP LOSS (Profit Protector) ---
+            # Track highest price seen since entry
+            if 'highest_price' not in position:
+                position['highest_price'] = current_price
+            else:
+                position['highest_price'] = max(position['highest_price'], current_price)
+
+            if pnl_pct > TRAILING_STOP_TRIGGER:
+                drawdown_from_peak = (position['highest_price'] - current_price) / position['highest_price']
+                if drawdown_from_peak > TRAILING_STOP_PCT:
+                    return True, (
+                        f"Trailing Stop (-{drawdown_from_peak*100:.1f}% from peak "
+                        f"${position['highest_price']:.4f})"
+                    )
+
+            # --- Exit 3: TREND KILL (EMA50) ---
+            ema_50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
+            if current_price < ema_50:
+                return True, "Trend Kill (< EMA50)"
+
+            # --- Exit 4: TIME STOP ---
+            cycles_held = position.get('cycles_held', 0)
             if cycles_held >= TIME_STOP_CYCLES and pnl_pct < MIN_RETURN_TO_HOLD:
                 return True, f"Time Stop ({cycles_held} cycles, {pnl_pct*100:.1f}%)"
-            
+
             return False, ""
-            
-        except Exception as e:
+
+        except Exception:
             return False, ""
     
     def check_trim_conditions(self, symbol):
         """
         Check if position should be trimmed.
-        Returns: (should_trim, reason)
-        
-        Trim conditions:
-        - RSI > 80
-        - Price > Upper Bollinger Band
+        Returns: (should_trim, reason, trim_pct)
+
+        Trim tiers:
+        - RSI > 85 → Heavy Trim (50%) — Extreme Overbought
+        - RSI > 80 → Standard Trim (25%) — Overbought
+        - Price > Upper Bollinger Band → Standard Trim (25%)
         """
         try:
             candles = exchange.fetch_ohlcv(symbol, '4h', limit=50)
             df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            # RSI
+
+            # RSI Calculation
             delta = df['close'].diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             rsi = (100 - (100 / (1 + rs))).iloc[-1]
-            
+
+            # Tier 1: Extreme overbought — sell 50%
+            if rsi > RSI_EXTREME_THRESHOLD:
+                return True, f"Extreme Overbought (RSI {rsi:.0f}) — Heavy Trim", HEAVY_TRIM_PERCENTAGE
+
+            # Tier 2: Standard overbought — sell 25%
             if rsi > RSI_TRIM_THRESHOLD:
-                return True, f"Overbought (RSI {rsi:.0f})"
-            
+                return True, f"Overbought (RSI {rsi:.0f})", TRIM_PERCENTAGE
+
             # Bollinger Bands
             sma_20 = df['close'].rolling(window=20).mean().iloc[-1]
             std_20 = df['close'].rolling(window=20).std().iloc[-1]
             upper_band = sma_20 + (2 * std_20)
             current_price = df['close'].iloc[-1]
-            
+
             if current_price > upper_band:
-                return True, "Above Bollinger Upper Band"
-            
-            return False, ""
-            
-        except Exception as e:
-            return False, ""
+                return True, "Above Bollinger Upper Band", TRIM_PERCENTAGE
+
+            return False, "", 0.0
+
+        except Exception:
+            return False, "", 0.0
 
 # =============================================================================
 # PAPER TRADING PORTFOLIO
@@ -1487,36 +1518,39 @@ class PaperPortfolio:
         })
         return True
     
-    def execute_trim(self, symbol, reason):
-        """Trim position by TRIM_PERCENTAGE"""
+    def execute_trim(self, symbol, reason, trim_pct=None):
+        """Trim position by trim_pct (defaults to TRIM_PERCENTAGE if not specified)"""
         if symbol not in self.positions:
             return False
-        
+
         position = self.positions[symbol]
-        price = self.get_current_price(symbol)
+        exchange_name = position.get('exchange', 'binance')
+        price = self.get_current_price(symbol, exchange_name)
         if not price:
             return False
-        
-        trim_qty = position['quantity'] * TRIM_PERCENTAGE
+
+        actual_trim_pct = trim_pct if trim_pct is not None else TRIM_PERCENTAGE
+        trim_qty = position['quantity'] * actual_trim_pct
         position['quantity'] -= trim_qty
-        
+
         trim_value = trim_qty * price
         self.balance += trim_value
-        
+
         entry_price = position['entry_price']
         pnl = (price - entry_price) * trim_qty
         pnl_pct = (price - entry_price) / entry_price * 100
-        
+
         self.realized_pnl += pnl
         if pnl > 0:
             self.winning_trades += 0.25  # Partial win
-        
+
         self.log_trade('TRIM', symbol, trim_qty, price, pnl=pnl, reason=reason)
         self.save_portfolio()
-        
-        print(f"📉 TRIM {symbol}: {TRIM_PERCENTAGE*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}")
-        event_logger.log('trim', f'TRIM {symbol}: {TRIM_PERCENTAGE*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}', {
-            'symbol': symbol, 'price': price, 'quantity': trim_qty, 'pnl': pnl, 'reason': reason
+
+        print(f"📉 TRIM {symbol}: {actual_trim_pct*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}")
+        event_logger.log('trim', f'TRIM {symbol}: {actual_trim_pct*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}', {
+            'symbol': symbol, 'price': price, 'quantity': trim_qty, 'pnl': pnl, 'pnl_pct': pnl_pct,
+            'trim_pct': actual_trim_pct, 'reason': reason
         })
         return True
 
@@ -1601,9 +1635,9 @@ class AlphaPrime:
                 continue
             
             # Trim checks (only if not exiting)
-            should_trim, trim_reason = self.executor.check_trim_conditions(symbol)
+            should_trim, trim_reason, trim_pct = self.executor.check_trim_conditions(symbol)
             if should_trim:
-                self.portfolio.execute_trim(symbol, trim_reason)
+                self.portfolio.execute_trim(symbol, trim_reason, trim_pct=trim_pct)
         
         global_state['last_medium_update'] = datetime.now().isoformat()
     
