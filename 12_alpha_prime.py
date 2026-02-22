@@ -75,7 +75,7 @@ RSI_EXTREME_THRESHOLD = 85    # Heavy trim when RSI > 85 (extreme overbought)
 TRIM_PERCENTAGE = 0.25        # Standard trim: 25% of position
 HEAVY_TRIM_PERCENTAGE = 0.50  # Heavy trim: 50% of position (extreme overbought)
 TRAILING_STOP_TRIGGER = 0.10  # Activate trailing stop after 10% gain
-TRAILING_STOP_PCT = 0.07      # Trail 7% below the all-time high for this position
+TRAILING_STOP_PCT = 0.04      # Trail 4% below the all-time high for this position
 HARD_STOP_LOSS_PCT = -0.05    # Hard stop loss at -5%
 TIME_STOP_CYCLES = 3          # Exit if no movement after N slow cycles
 MIN_RETURN_TO_HOLD = 0.02     # 2% minimum return to keep holding
@@ -617,6 +617,21 @@ class AlphaScorer:
                 # nudges the score without overriding momentum signal.
                 final_score = base_score + verdict_bonus
 
+            # ── Z-Score Exhaustion Filter (Rubber Band) ───────────────────
+            # If price is > 2.5 standard deviations above its 20-day mean
+            # AND volume is below its 20-day average → rubber band is about
+            # to snap back. Block entry by zeroing the score.
+            ma_20      = df['close'].rolling(window=20).mean().iloc[-1]
+            std_20     = df['close'].rolling(window=20).std().iloc[-1]
+            price_zscore = (current_price - ma_20) / std_20 if std_20 > 0 else 0
+
+            vol_mean   = df['volume'].rolling(window=20).mean().iloc[-1]
+            vol_zscore = (df['volume'].iloc[-1] - vol_mean) / (df['volume'].rolling(window=20).std().iloc[-1] + 1e-9)
+
+            zscore_exhausted = (price_zscore > 2.5 and vol_zscore < 0)
+            if zscore_exhausted:
+                final_score = 0.0   # Block entry — price extended, volume drying up
+
             details = {
                 'symbol':              symbol,
                 'exchange':            exchange_name,
@@ -634,6 +649,8 @@ class AlphaScorer:
                 'verdict_confidence':  verdict_confidence,
                 'reddit_mentions':     mention_count,
                 'verdict_bonus':       verdict_bonus,
+                'price_zscore':        round(price_zscore, 2),
+                'zscore_exhausted':    zscore_exhausted,
                 'final_score':         final_score
             }
 
@@ -1156,7 +1173,22 @@ class ExecutionMonitor:
 
 class EventLogger:
     """Thread-safe event logger for streaming server-side events to dashboard."""
-    
+
+    # IST = UTC+5:30
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+
+    # Emoji icons for each event type shown in the human-readable log
+    TYPE_ICONS = {
+        'buy':    '🟢 BUY   ',
+        'sell':   '🔴 SELL  ',
+        'trim':   '📉 TRIM  ',
+        'regime': '🌐 REGIME',
+        'signal': '📡 SIGNAL',
+        'warn':   '⚠️  WARN  ',
+        'error':  '❌ ERROR ',
+        'info':   'ℹ️  INFO  ',
+    }
+
     def __init__(self, log_file='alpha_prime_events.jsonl', max_events=500):
         self.events = []  # List of {timestamp, type, message, details}
         self.max_events = max_events
@@ -1164,18 +1196,23 @@ class EventLogger:
         self._lock = threading.Lock()
         self._event_id = 0
         self._load_from_file()
-    
+
+    def _human_log_path(self):
+        """Return today's (IST) human-readable log filename."""
+        today_ist = (datetime.utcnow() + self.IST_OFFSET).strftime('%Y-%m-%d')
+        return f'alpha_prime_{today_ist}.log'
+
     def _load_from_file(self):
         """Load recent events from log file on startup"""
         if not os.path.exists(self.log_file):
             return
-            
+
         try:
             with open(self.log_file, 'r') as f:
                 lines = f.readlines()
                 # Load last N lines to avoid reading massive files
                 start_idx = max(0, len(lines) - self.max_events)
-                
+
                 for line in lines[start_idx:]:
                     try:
                         event = json.loads(line)
@@ -1184,11 +1221,34 @@ class EventLogger:
                         self._event_id = max(self._event_id, event.get('id', 0))
                     except:
                         continue
-                        
+
             print(f"📂 Loaded {len(self.events)} events from {self.log_file}")
-            
+
         except Exception as e:
             print(f"⚠️  Could not load events: {e}")
+
+    def _write_human_log(self, event):
+        """Append one line to today's human-readable IST log file."""
+        try:
+            # Convert UTC timestamp to IST
+            utc_dt = datetime.fromisoformat(event['timestamp'].rstrip('Z'))
+            ist_dt  = utc_dt + self.IST_OFFSET
+            time_str = ist_dt.strftime('%Y-%m-%d %H:%M:%S IST')
+
+            icon = self.TYPE_ICONS.get(event['type'], '         ')
+            line = f"[{time_str}]  {icon}  {event['message']}\n"
+
+            log_path = self._human_log_path()
+            # Write a header if this is a brand-new file
+            write_header = not os.path.exists(log_path)
+            with open(log_path, 'a') as f:
+                if write_header:
+                    f.write(f"{'='*80}\n")
+                    f.write(f"  Alpha Prime v2 — System Log ({ist_dt.strftime('%A, %d %B %Y')})\n")
+                    f.write(f"{'='*80}\n")
+                f.write(line)
+        except Exception as e:
+            pass  # Never crash the main loop over a log write
 
     def log(self, event_type, message, details=None):
         """Log an event. Types: info, buy, sell, trim, regime, signal, warn, error"""
@@ -1201,18 +1261,21 @@ class EventLogger:
                 'message': message,
                 'details': details or {}
             }
-            
+
             # Memory
             self.events.append(event)
             if len(self.events) > self.max_events:
                 self.events = self.events[-self.max_events:]
-            
-            # File Persistence
+
+            # JSONL persistence (machine-readable, dashboard source)
             try:
                 with open(self.log_file, 'a') as f:
                     f.write(json.dumps(event) + "\n")
             except Exception as e:
                 print(f"⚠️  Could not write event to file: {e}")
+
+            # Human-readable daily log (IST timestamps, easy to read on wakeup)
+            self._write_human_log(event)
     
     def get_events(self, since_id=0, limit=100):
         """Get events after a given ID (for incremental polling)."""
@@ -1278,6 +1341,30 @@ class ExecutionEngine:
                         f"Trailing Stop (-{drawdown_from_peak*100:.1f}% from peak "
                         f"${position['highest_price']:.4f})"
                     )
+
+            # --- Exit 5: VSA BEARISH DIVERGENCE (Distribution Signal) ---
+            # Find the two most recent local price peaks in the 4H data.
+            # If the second peak is higher in price but came on LOWER volume
+            # than the first peak → buying exhaustion → distribution phase.
+            highs  = df['high'].values
+            vols   = df['volume'].values
+            peaks  = []
+            for i in range(2, len(highs) - 1):
+                if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
+                    peaks.append((i, highs[i], vols[i]))
+
+            if len(peaks) >= 2:
+                prev_peak  = peaks[-2]   # (idx, price, volume)
+                curr_peak  = peaks[-1]
+                # Higher price peak but LOWER volume = bearish divergence
+                if curr_peak[1] > prev_peak[1] and curr_peak[2] < prev_peak[2]:
+                    div_ratio = (prev_peak[2] - curr_peak[2]) / (prev_peak[2] + 1e-9)
+                    # Only trigger if volume dropped >= 15% at the new high
+                    if div_ratio >= 0.15:
+                        return True, (
+                            f"VSA Bearish Divergence — higher high (${curr_peak[1]:.4f}) "
+                            f"on {div_ratio*100:.0f}% less volume"
+                        )
 
             # --- Exit 3: TREND KILL (EMA50) ---
             ema_50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
