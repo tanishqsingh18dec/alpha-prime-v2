@@ -66,7 +66,7 @@ ENABLED_EXCHANGES = ['binance', 'kucoin', 'gateio', 'mexc', 'bybit', 'kraken', '
 
 # 3-Speed Architecture
 FAST_INTERVAL = 30      # 30 seconds - price observation
-MEDIUM_INTERVAL = 300   # 5 minutes - exit checks
+MEDIUM_INTERVAL = 600   # 10 minutes - exit checks (live-price stop monitoring)
 SLOW_INTERVAL = 1800    # 30 minutes - full rebalance
 
 # Exit thresholds
@@ -1324,7 +1324,12 @@ class ExecutionEngine:
                 return False, ""
             df = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-            current_price = df['close'].iloc[-1]
+            # --- LIVE price for stop calculations (not the stale 4H candle close) ---
+            # The 4H close only updates every 4 hours. During a flash crash the candle
+            # can be hours old. Live price catches the move in real time.
+            live_price = scanner.get_current_price(symbol, exchange_name)
+            current_price = live_price if live_price else df['close'].iloc[-1]
+
             entry_price = position['entry_price']
             pnl_pct = (current_price - entry_price) / entry_price
 
