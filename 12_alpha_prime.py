@@ -93,6 +93,7 @@ global_state = {
     'regime': 'UNKNOWN',
     'regime_details': {},
     'top_coins': [],
+    'watchlist': [],          # Full top-15 ranked watchlist (for dashboard display)
     'positions': {},
     'balance': STARTING_BALANCE,
     'portfolio_value': STARTING_BALANCE,
@@ -1828,6 +1829,19 @@ class AlphaPrime:
 
         global_state['top_coins'] = top_n
 
+        # ── Full watchlist: top 15 for dashboard (more than just trading slots) ──
+        # This is what shows in Alpha Rankings. Includes coins ranked beyond active_n
+        # so you can see potential re-entries (like PIPPIN bouncing back at rank #7).
+        WATCHLIST_SIZE = 15
+        top_symbols_set = {c['symbol'] for c in top_n}
+        watchlist = []
+        for coin in ranked[:WATCHLIST_SIZE]:
+            watchlist.append({
+                **coin,
+                'is_selected': coin['symbol'] in top_symbols_set  # True = in active trading shortlist
+            })
+        global_state['watchlist'] = watchlist
+
         # Log top coins as signal events
         for coin in top_n:
             event_logger.log('signal', f'RANKED #{top_n.index(coin)+1}: {coin["symbol"]} | Score: {coin["final_score"]:.4f} | Mom7d: {coin["momentum_7d"]:.1%} | {coin.get("exchange","binance").upper()}')
@@ -3073,12 +3087,19 @@ def api_logs():
 
 @app.route('/api/top_ranked')
 def api_top_ranked():
-    """Current top-ranked coins from the latest scoring cycle."""
+    """Top-15 watchlist from the latest scoring cycle.
+    
+    Returns ranked coins with is_selected=True for those in the active trading
+    shortlist and is_selected=False for watchlist-only coins.
+    """
     try:
-        top_coins = global_state.get('top_coins', [])
-        # Build safe list (some coin detail values may not be JSON-safe)
+        watchlist = global_state.get('watchlist', [])
+        # Fall back to top_coins for backwards compatibility
+        if not watchlist:
+            watchlist = global_state.get('top_coins', [])
+
         ranked = []
-        for i, coin in enumerate(top_coins):
+        for i, coin in enumerate(watchlist):
             ranked.append({
                 'rank': i + 1,
                 'symbol': coin.get('symbol', ''),
@@ -3089,11 +3110,16 @@ def api_top_ranked():
                 'volatility': float(coin.get('volatility', 0)),
                 'trend_filter': int(coin.get('trend_filter', 0)),
                 'weight': float(coin.get('weight', 0)),
+                'price_zscore': float(coin.get('price_zscore', 0)),
+                'zscore_exhausted': bool(coin.get('zscore_exhausted', False)),
+                'is_selected': bool(coin.get('is_selected', False)),  # In active trading shortlist
             })
+        active_n = POSITIONS_BY_REGIME.get(global_state.get('regime', 'UNKNOWN'), 5)
         return jsonify({
             'ranked': ranked,
             'regime': global_state.get('regime', 'UNKNOWN'),
-            'total_scanned': len(global_state.get('top_coins', [])),
+            'active_n': active_n,          # How many slots the bot is trading right now
+            'total_scanned': len(ranked),
             'last_update': global_state.get('last_slow_update')
         })
     except Exception as e:
