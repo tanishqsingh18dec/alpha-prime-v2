@@ -75,7 +75,7 @@ RSI_EXTREME_THRESHOLD = 85    # Heavy trim when RSI > 85 (extreme overbought)
 TRIM_PERCENTAGE = 0.25        # Standard trim: 25% of position
 HEAVY_TRIM_PERCENTAGE = 0.50  # Heavy trim: 50% of position (extreme overbought)
 TRAILING_STOP_TRIGGER = 0.10  # Activate trailing stop after 10% gain
-TRAILING_STOP_PCT = 0.04      # Trail 4% below the all-time high for this position
+TRAILING_STOP_PCT = 0.06      # Trail 6% below the all-time high for this position
 HARD_STOP_LOSS_PCT = -0.05    # Hard stop loss at -5%
 TIME_STOP_CYCLES = 3          # Exit if no movement after N slow cycles
 MIN_RETURN_TO_HOLD = 0.02     # 2% minimum return to keep holding
@@ -1309,14 +1309,19 @@ class ExecutionEngine:
         Returns: (should_exit, reason)
 
         Exit conditions:
-        1. Hard Stop Loss: -5% from entry  → immediate exit
-        2. Trailing Stop: 7% drop from peak (only active after 10% gain)
-        3. Trend Kill: price < 4H EMA 50
-        4. Time Stop: held N cycles with insufficient return
+        1. Hard Stop Loss:  -5% from entry         → immediate exit
+        2. Trailing Stop:    4% drop from peak      → only active after 10% gain
+        3. VSA Divergence:  higher high, less vol  → distribution detected
+        4. Trend Kill:      price < 4H EMA 50
+        5. Time Stop:       held N cycles with low return
         """
         try:
-            # Fetch 4H data for EMA50
-            candles_4h = exchange.fetch_ohlcv(symbol, '4h', limit=50)
+            # Use the exchange the position was actually traded on
+            exchange_name = position.get('exchange', 'binance')
+            candles_4h = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
+            if not candles_4h or len(candles_4h) < 10:
+                event_logger.log('warn', f'check_exit: no 4H data for {symbol} on {exchange_name}')
+                return False, ""
             df = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
             current_price = df['close'].iloc[-1]
@@ -1328,24 +1333,20 @@ class ExecutionEngine:
                 return True, f"Hard Stop Loss ({pnl_pct*100:.1f}%)"
 
             # --- Exit 2: TRAILING STOP LOSS (Profit Protector) ---
-            # Track highest price seen since entry
+            # Track highest price seen since entry — active from day 1, no gain threshold
             if 'highest_price' not in position:
                 position['highest_price'] = current_price
             else:
                 position['highest_price'] = max(position['highest_price'], current_price)
 
-            if pnl_pct > TRAILING_STOP_TRIGGER:
-                drawdown_from_peak = (position['highest_price'] - current_price) / position['highest_price']
-                if drawdown_from_peak > TRAILING_STOP_PCT:
-                    return True, (
-                        f"Trailing Stop (-{drawdown_from_peak*100:.1f}% from peak "
-                        f"${position['highest_price']:.4f})"
-                    )
+            drawdown_from_peak = (position['highest_price'] - current_price) / position['highest_price']
+            if drawdown_from_peak > TRAILING_STOP_PCT:
+                return True, (
+                    f"Trailing Stop (-{drawdown_from_peak*100:.1f}% from peak "
+                    f"${position['highest_price']:.4f})"
+                )
 
-            # --- Exit 5: VSA BEARISH DIVERGENCE (Distribution Signal) ---
-            # Find the two most recent local price peaks in the 4H data.
-            # If the second peak is higher in price but came on LOWER volume
-            # than the first peak → buying exhaustion → distribution phase.
+            # --- Exit 3: VSA BEARISH DIVERGENCE (Distribution Signal) ---
             highs  = df['high'].values
             vols   = df['volume'].values
             peaks  = []
@@ -1354,34 +1355,33 @@ class ExecutionEngine:
                     peaks.append((i, highs[i], vols[i]))
 
             if len(peaks) >= 2:
-                prev_peak  = peaks[-2]   # (idx, price, volume)
-                curr_peak  = peaks[-1]
-                # Higher price peak but LOWER volume = bearish divergence
+                prev_peak = peaks[-2]
+                curr_peak = peaks[-1]
                 if curr_peak[1] > prev_peak[1] and curr_peak[2] < prev_peak[2]:
                     div_ratio = (prev_peak[2] - curr_peak[2]) / (prev_peak[2] + 1e-9)
-                    # Only trigger if volume dropped >= 15% at the new high
                     if div_ratio >= 0.15:
                         return True, (
                             f"VSA Bearish Divergence — higher high (${curr_peak[1]:.4f}) "
                             f"on {div_ratio*100:.0f}% less volume"
                         )
 
-            # --- Exit 3: TREND KILL (EMA50) ---
+            # --- Exit 4: TREND KILL (EMA50) ---
             ema_50 = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
             if current_price < ema_50:
                 return True, "Trend Kill (< EMA50)"
 
-            # --- Exit 4: TIME STOP ---
+            # --- Exit 5: TIME STOP ---
             cycles_held = position.get('cycles_held', 0)
             if cycles_held >= TIME_STOP_CYCLES and pnl_pct < MIN_RETURN_TO_HOLD:
                 return True, f"Time Stop ({cycles_held} cycles, {pnl_pct*100:.1f}%)"
 
             return False, ""
 
-        except Exception:
+        except Exception as e:
+            event_logger.log('error', f'check_exit_conditions FAILED for {symbol}: {e}')
             return False, ""
     
-    def check_trim_conditions(self, symbol):
+    def check_trim_conditions(self, symbol, exchange_name='binance'):
         """
         Check if position should be trimmed.
         Returns: (should_trim, reason, trim_pct)
@@ -1392,7 +1392,10 @@ class ExecutionEngine:
         - Price > Upper Bollinger Band → Standard Trim (25%)
         """
         try:
-            candles = exchange.fetch_ohlcv(symbol, '4h', limit=50)
+            candles = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
+            if not candles or len(candles) < 20:
+                event_logger.log('warn', f'check_trim: no 4H data for {symbol} on {exchange_name}')
+                return False, "", 0.0
             df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
             # RSI Calculation
@@ -1421,7 +1424,8 @@ class ExecutionEngine:
 
             return False, "", 0.0
 
-        except Exception:
+        except Exception as e:
+            event_logger.log('error', f'check_trim_conditions FAILED for {symbol}: {e}')
             return False, "", 0.0
 
 # =============================================================================
@@ -1722,7 +1726,8 @@ class AlphaPrime:
                 continue
             
             # Trim checks (only if not exiting)
-            should_trim, trim_reason, trim_pct = self.executor.check_trim_conditions(symbol)
+            exchange_name = position.get('exchange', 'binance')
+            should_trim, trim_reason, trim_pct = self.executor.check_trim_conditions(symbol, exchange_name)
             if should_trim:
                 self.portfolio.execute_trim(symbol, trim_reason, trim_pct=trim_pct)
         
