@@ -47,15 +47,49 @@ warnings.filterwarnings('ignore')
 
 STARTING_BALANCE = 100.0
 # Dynamic position count by market regime
-# Bullish market  → more bets, spread the alpha
-# Uncertain/chop  → trim down, preserve capital
-# Bearish/risk-off → cash only (handled by early return in slow_loop)
-POSITIONS_BY_REGIME = {
-    'RISK_ON':  10,   # Bull market  — hold up to 8 coins
-    'CHOP':     4,   # Sideways     — hold up to 3 coins
-    'RISK_OFF': 1,   # Bear market  — exit all, hold cash
-    'UNKNOWN':  5,   # No signal    — conservative, max 2 coins
+# Maximum positions allowed per regime (hard ceiling — never exceeded)
+# The actual number is determined dynamically by confidence + signal quality.
+# Think of these as the "best case" — you only reach the ceiling when the
+# market is screaming BUY and every ranked coin has a strong signal.
+MAX_POSITIONS_BY_REGIME = {
+    'RISK_ON':  10,  # Bull market ceiling: up to 10 coins
+    'CHOP':      5,  # Sideways ceiling: up to 5 coins
+    'RISK_OFF':  0,  # Bear market: always cash
+    'UNKNOWN':   6,  # No signal ceiling: conservative
 }
+
+# Minimum alpha score a coin needs to be worth holding a full position
+MIN_ALPHA_SCORE_TO_HOLD = 0.8
+
+def compute_dynamic_n(regime, hmm_confidence, ranked):
+    """
+    Dynamically decide how many positions to hold this cycle.
+
+    Factors (in order of importance):
+    1. Regime ceiling   — hard upper bound per market condition
+    2. HMM confidence   — how certain the ML model is about that regime
+    3. Signal quality   — how many ranked coins actually have a strong score
+
+    Result:
+      n = floor(ceiling × confidence_factor) capped at quality_coins
+    """
+    ceiling = MAX_POSITIONS_BY_REGIME.get(regime, 5)
+    if ceiling == 0:
+        return 0
+
+    # HMM confidence maps 0%→50% → scale 0.4→1.0
+    # (Even at 0% confidence we still take some positions — never go to 0)
+    confidence_factor = 0.40 + (hmm_confidence * 0.60)
+
+    # Count how many ranked coins are actually worth holding
+    quality_coins = sum(1 for c in ranked if c.get('final_score', 0) > MIN_ALPHA_SCORE_TO_HOLD and not c.get('zscore_exhausted', False))
+
+    # Compute the confidence-scaled target
+    target = ceiling * confidence_factor
+
+    # Final N = min(confidence target, quality coin count, ceiling)
+    n = int(min(target, quality_coins, ceiling))
+    return max(n, 1)  # always hold at least 1 position
 MAX_POSITION_PCT = 0.40       # Max 40% in one position
 TARGET_INVESTMENT_PCT = 0.90  # Deploy up to 90% of portfolio; keep 10% as cash buffer
 MIN_COIN_VOLUME_24H = 1_000_000  # Lowered to $1M to catch more opportunities
@@ -1815,8 +1849,13 @@ class AlphaPrime:
             print("   ⚠️  No coins to rank")
             return
         
-        # ── Dynamic position count based on regime ─────────────────────────
-        active_n = POSITIONS_BY_REGIME.get(effective_regime, 2)
+        # ── Dynamic position count: regime ceiling × HMM confidence × signal quality ──
+        hmm_conf   = global_state.get('hmm_confidence', 0.5)
+        active_n   = compute_dynamic_n(effective_regime, hmm_conf, ranked)
+        ceiling    = MAX_POSITIONS_BY_REGIME.get(effective_regime, 6)
+        quality_n  = sum(1 for c in ranked if c.get('final_score', 0) > MIN_ALPHA_SCORE_TO_HOLD)
+        print(f"\n   🎯 DYNAMIC N = {active_n}  "
+              f"(ceiling: {ceiling} | HMM conf: {hmm_conf:.0%} | quality coins: {quality_n})")
         top_n = ranked[:active_n]
         self.top_ranked = top_n
 
@@ -3114,7 +3153,7 @@ def api_top_ranked():
                 'zscore_exhausted': bool(coin.get('zscore_exhausted', False)),
                 'is_selected': bool(coin.get('is_selected', False)),  # In active trading shortlist
             })
-        active_n = POSITIONS_BY_REGIME.get(global_state.get('regime', 'UNKNOWN'), 5)
+        active_n = MAX_POSITIONS_BY_REGIME.get(global_state.get('regime', 'UNKNOWN'), 6)
         return jsonify({
             'ranked': ranked,
             'regime': global_state.get('regime', 'UNKNOWN'),
