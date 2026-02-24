@@ -1,54 +1,152 @@
 """
 Multi-Exchange Scanner for Alpha Prime v2
 Scans multiple cryptocurrency exchanges and aggregates viable trading opportunities.
+Includes derivatives data (funding rates, OI) and order book microstructure.
 """
 
 import ccxt
 from datetime import datetime
 
+# Exchanges that support perpetual futures via CCXT (used for funding/OI)
+SWAP_CAPABLE = {'binance', 'bybit', 'gateio', 'mexc', 'bitget', 'kucoin'}
+
 class MultiExchangeScanner:
     """
     Scans multiple exchanges and provides unified interface for:
-    - Market data fetching
+    - Market data fetching (spot + derivatives)
     - Coin filtering
     - Price lookups
+    - Order book microstructure (spread, depth, imbalance)
+    - Funding rates & Open Interest (via swap connections)
     - Order execution routing
     """
-    
+
     def __init__(self, exchanges=['binance', 'kucoin', 'gateio', 'mexc', 'bybit', 'kraken', 'bitget']):
         """
-        Initialize scanner with specified exchanges.
-        
+        Initialize scanner with spot + swap connections per exchange.
+
         Args:
-            exchanges: List of exchange names to enable (default: all 4)
+            exchanges: List of exchange names to enable
         """
-        self.exchanges = {}
+        self.exchanges = {}       # Spot connections
+        self.swap_exchanges = {}  # Futures/swap connections (for funding + OI)
         self.enabled_exchanges = exchanges
-        
+
         print(f"\n{'='*80}")
         print(f"🌐 MULTI-EXCHANGE SCANNER INITIALIZATION")
         print(f"{'='*80}")
-        
+
         for name in exchanges:
             try:
-                self.exchanges[name] = self._init_exchange(name)
-                print(f"   ✅ {name.upper()} connected")
+                self.exchanges[name] = self._init_exchange(name, 'spot')
+                print(f"   ✅ {name.upper()} spot connected")
             except Exception as e:
-                print(f"   ⚠️  {name.upper()} failed to connect: {e}")
-                print(f"      Continuing without {name}...")
-        
+                print(f"   ⚠️  {name.upper()} spot failed: {e}")
+
+            # Initialize swap connection for derivatives data (funding, OI)
+            if name in SWAP_CAPABLE:
+                try:
+                    self.swap_exchanges[name] = self._init_exchange(name, 'swap')
+                    print(f"   ✅ {name.upper()} swap connected (derivatives)")
+                except Exception:
+                    pass  # Non-critical — derivatives data is optional
+
         print(f"{'='*80}\n")
-    
-    def _init_exchange(self, name):
+
+    def _init_exchange(self, name, market_type='spot'):
         """Initialize a single exchange connection."""
         exchange_class = getattr(ccxt, name)
         exchange = exchange_class({
             'enableRateLimit': True,
             'options': {
-                'defaultType': 'spot',
+                'defaultType': market_type,
             }
         })
         return exchange
+
+    # ─── Derivatives Data (Funding Rates, Open Interest) ─────────────────
+
+    def fetch_funding_rate(self, symbol, exchange_name):
+        """
+        Fetch the current perpetual funding rate for a symbol.
+
+        Returns:
+            Funding rate as a float (e.g., 0.0003 = 0.03%) or None if unavailable.
+        """
+        try:
+            swap_ex = self.swap_exchanges.get(exchange_name)
+            if not swap_ex:
+                return None
+
+            # CCXT expects the swap symbol format (e.g., BTC/USDT:USDT)
+            swap_symbol = symbol.replace('/USDT', '/USDT:USDT')
+            result = swap_ex.fetch_funding_rate(swap_symbol)
+            return result.get('fundingRate')
+        except Exception:
+            return None
+
+    def fetch_open_interest(self, symbol, exchange_name):
+        """
+        Fetch the current open interest for a symbol's perpetual contract.
+
+        Returns:
+            Open interest value (USDT notional) or None if unavailable.
+        """
+        try:
+            swap_ex = self.swap_exchanges.get(exchange_name)
+            if not swap_ex:
+                return None
+
+            swap_symbol = symbol.replace('/USDT', '/USDT:USDT')
+            result = swap_ex.fetch_open_interest(swap_symbol)
+            return result.get('openInterestAmount') or result.get('openInterest')
+        except Exception:
+            return None
+
+    # ─── Order Book Microstructure ───────────────────────────────────────
+
+    def fetch_order_book_summary(self, symbol, exchange_name, depth=20):
+        """
+        Fetch top-N levels of the order book and compute microstructure metrics.
+
+        Returns:
+            dict with:
+              spread_pct  — bid-ask spread as percentage of mid-price
+              bid_depth   — total USDT liquidity in top bids
+              ask_depth   — total USDT liquidity in top asks
+              imbalance   — (bid_depth - ask_depth) / (bid_depth + ask_depth)
+                             +1.0 = all bids (bullish pressure)
+                             -1.0 = all asks (selling pressure)
+            or None if error.
+        """
+        try:
+            ex = self.exchanges.get(exchange_name)
+            if not ex:
+                return None
+
+            book = ex.fetch_order_book(symbol, limit=depth)
+
+            if not book['bids'] or not book['asks']:
+                return None
+
+            best_bid = book['bids'][0][0]
+            best_ask = book['asks'][0][0]
+            mid = (best_bid + best_ask) / 2
+            spread_pct = ((best_ask - best_bid) / mid) * 100 if mid > 0 else 0
+
+            bid_depth = sum(price * qty for price, qty in book['bids'])
+            ask_depth = sum(price * qty for price, qty in book['asks'])
+            total = bid_depth + ask_depth
+            imbalance = (bid_depth - ask_depth) / total if total > 0 else 0
+
+            return {
+                'spread_pct': spread_pct,
+                'bid_depth': bid_depth,
+                'ask_depth': ask_depth,
+                'imbalance': imbalance,
+            }
+        except Exception:
+            return None
     
     def get_all_viable_coins(self, min_volume=2_000_000):
         """

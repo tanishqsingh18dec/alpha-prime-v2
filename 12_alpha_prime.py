@@ -22,12 +22,14 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, render_template_string, request
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import pickle
 import warnings
 from pathlib import Path
 from multi_exchange import MultiExchangeScanner
+from trade_analyzer import TradeAnalyzer
 
 # ML imports for HMM and Portfolio Optimizer
 try:
@@ -120,6 +122,7 @@ TRADE_HISTORY_FILE = "alpha_prime_trades.csv"
 
 exchange = ccxt.binance({'enableRateLimit': True})  # Keep for regime detection (BTC/ETH)
 scanner = MultiExchangeScanner(ENABLED_EXCHANGES)   # Multi-exchange scanner
+trade_analyzer = TradeAnalyzer(TRADE_HISTORY_FILE, scanner)  # Post-trade feedback + Kelly stats
 
 # Global state
 app = Flask(__name__)
@@ -145,6 +148,7 @@ global_state = {
     'optimizer_sharpe': 0.0,
     'optimizer_active': False,
 }
+state_lock = threading.Lock()  # Thread-safe access for Flask dashboard reads
 
 # =============================================================================
 # LAYER 1: MARKET REGIME DETECTOR
@@ -572,26 +576,28 @@ class AlphaScorer:
     """
 
     # Blending weights: how much each signal contributes to the final score
-    MOMENTUM_WEIGHT  = 0.80   # 80% price-based momentum
-    SENTIMENT_WEIGHT = 0.20   # 20% Reddit crowd sentiment
+    MOMENTUM_WEIGHT  = 0.65   # 65% price-based momentum (still king)
+    SENTIMENT_WEIGHT = 0.15   # 15% Reddit crowd sentiment
+    FUEL_WEIGHT      = 0.10   # 10% derivatives fuel (funding rate signal)
+    VOLUME_WEIGHT    = 0.10   # 10% relative volume intensity (RVOL)
 
     @staticmethod
     def calculate_score(coin_data):
         """
-        Calculate volatility-adjusted momentum score for a coin,
-        blended with Reddit sentiment.
+        Calculate multi-factor score for a coin:
+          - Volatility-adjusted momentum (65%)
+          - Reddit sentiment (15%)
+          - Derivatives fuel — funding rate signal (10%)
+          - Relative Volume — RVOL intensity (10%)
 
         Formula:
           RawMomentum     = 0.6 * Momentum_7d + 0.4 * Momentum_24h
           RiskAdjMomentum = RawMomentum / Volatility
           MomentumScore   = RiskAdjMomentum * TrendFilter
+          FuelScore        = funding_rate_to_signal(funding_rate)    [-1, +1]
+          RvolScore       = clamp((rvol - 1) / 3, -1, +1)
 
-          SentimentScore  = reddit_sentiment[-1, +1]  (from SentimentLoader)
-
-          FinalScore = 0.80 * MomentumScore + 0.20 * SentimentScore
-
-        If sentiment data is unavailable, SentimentScore = 0 (neutral),
-        so the formula degrades gracefully to pure momentum.
+          FinalScore = 0.65*Momentum + 0.15*Sentiment + 0.10*Fuel + 0.10*RVOL
         """
         try:
             symbol = coin_data['symbol']
@@ -638,6 +644,38 @@ class AlphaScorer:
             mention_count     = sentiment_loader.get_mention_count(symbol)
             verdict_bonus     = sentiment_loader.get_verdict_bonus(symbol)
 
+            # ── RVOL score (volume intensity — uses existing data) ──────────
+            avg_volume_30d = df['volume'].mean()
+            today_volume   = df['volume'].iloc[-1]
+            rvol = today_volume / avg_volume_30d if avg_volume_30d > 0 else 1.0
+            # RVOL=4× → score +1.0, RVOL=1× → score 0.0, RVOL=0.25× → score -0.25
+            rvol_score = max(-1.0, min(1.0, (rvol - 1.0) / 3.0))
+
+            # ── Fuel score (derivatives signal — one API call) ────────────
+            # Funding rate: positive = longs pay shorts (overcrowded)
+            #               negative = shorts pay longs (bullish)
+            funding_rate = scanner.fetch_funding_rate(symbol, exchange_name)
+            if funding_rate is not None:
+                # ── Funding Divergence: the real alpha ──
+                # Deeply negative funding + price holding above EMA50 = SHORT SQUEEZE
+                # Shorts are paying to stay short, but price isn't dropping.
+                if funding_rate < -0.0003 and trend_filter == 1:
+                    fuel_score = 1.0     # Maximum bullish — short squeeze imminent
+                elif funding_rate < -0.0001 and trend_filter == 1:
+                    fuel_score = 0.7     # Moderate squeeze signal
+                elif funding_rate > 0.0005:       # > 0.05% per 8h = extreme greed
+                    fuel_score = -1.0
+                elif funding_rate > 0.0003:     # > 0.03% = overcrowded
+                    fuel_score = -0.5
+                elif funding_rate > 0.0001:     # > 0.01% = mild bullish bias
+                    fuel_score = 0.0
+                elif funding_rate > -0.0001:    # roughly neutral
+                    fuel_score = 0.2
+                else:                           # moderately negative
+                    fuel_score = 0.5
+            else:
+                fuel_score = 0.0  # no derivatives data — neutral fallback
+
             # ── Blended final score ───────────────────────────────────────
             # If trend filter is OFF (price below EMA50), kill the whole score
             # regardless of sentiment — we don't fight a downtrend.
@@ -646,7 +684,9 @@ class AlphaScorer:
             else:
                 base_score = (
                     AlphaScorer.MOMENTUM_WEIGHT  * momentum_score +
-                    AlphaScorer.SENTIMENT_WEIGHT * sentiment_score
+                    AlphaScorer.SENTIMENT_WEIGHT * sentiment_score +
+                    AlphaScorer.FUEL_WEIGHT      * fuel_score +
+                    AlphaScorer.VOLUME_WEIGHT    * rvol_score
                 )
                 # Apply verdict bonus: SHOOT_UP/DOWN at HIGH/MEDIUM confidence
                 # nudges the score without overriding momentum signal.
@@ -667,6 +707,26 @@ class AlphaScorer:
             if zscore_exhausted:
                 final_score = 0.0   # Block entry — price extended, volume drying up
 
+            # ── Order book microstructure: liquidity penalty + imbalance ──
+            ob_summary = scanner.fetch_order_book_summary(symbol, exchange_name)
+            ob_imbalance = 0.0
+            ob_bonus = 0.0
+            ob_depth_ok = True
+            if ob_summary:
+                ob_imbalance = ob_summary.get('imbalance', 0.0)
+                # Liquidity penalty: if depth within ~0.5% is very thin, downrank
+                total_depth = ob_summary.get('bid_depth', 0) + ob_summary.get('ask_depth', 0)
+                if total_depth < 5000:  # Less than $5k in top-20 levels
+                    final_score *= 0.5   # Halve score — can't exit without slippage
+                    ob_depth_ok = False
+
+                # OB imbalance tiebreaker: heavy buy walls = leading indicator
+                if ob_imbalance > 0.3:
+                    ob_bonus = 0.05     # Small bullish nudge
+                elif ob_imbalance < -0.3:
+                    ob_bonus = -0.05    # Small bearish nudge
+                final_score += ob_bonus
+
             details = {
                 'symbol':              symbol,
                 'exchange':            exchange_name,
@@ -684,6 +744,13 @@ class AlphaScorer:
                 'verdict_confidence':  verdict_confidence,
                 'reddit_mentions':     mention_count,
                 'verdict_bonus':       verdict_bonus,
+                'rvol':                round(rvol, 2),
+                'rvol_score':          round(rvol_score, 3),
+                'funding_rate':        funding_rate,
+                'fuel_score':          round(fuel_score, 3),
+                'ob_imbalance':        round(ob_imbalance, 3),
+                'ob_bonus':            round(ob_bonus, 3),
+                'ob_depth_ok':         ob_depth_ok,
                 'price_zscore':        round(price_zscore, 2),
                 'zscore_exhausted':    zscore_exhausted,
                 'final_score':         final_score
@@ -697,17 +764,26 @@ class AlphaScorer:
     @staticmethod
     def rank_universe(coin_data_list):
         """
-        Score all coins and return sorted by final_score.
-        Now handles list of coin dicts (with exchange info).
+        Score all coins CONCURRENTLY and return sorted by final_score.
+        Uses ThreadPoolExecutor to fetch data for all coins in parallel
+        instead of sequentially — ~10× faster for 60+ coins.
         """
         results = []
-        
-        for coin_data in coin_data_list:
-            score, details = AlphaScorer.calculate_score(coin_data)
-            if score is not None:
-                results.append(details)
-            time.sleep(0.1)  # Rate limiting
-        
+
+        def _score_one(coin_data):
+            try:
+                return AlphaScorer.calculate_score(coin_data)
+            except Exception:
+                return None, None
+
+        # 10 workers — CCXT's per-exchange rate limiter handles throttling
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {pool.submit(_score_one, cd): cd for cd in coin_data_list}
+            for future in as_completed(futures):
+                score, details = future.result()
+                if score is not None:
+                    results.append(details)
+
         # Sort by final_score descending
         results.sort(key=lambda x: x['final_score'], reverse=True)
         return results
@@ -1462,6 +1538,11 @@ class ExecutionEngine:
             if current_price > upper_band:
                 return True, "Above Bollinger Upper Band", TRIM_PERCENTAGE
 
+            # Tier 4: Funding rate overcrowding — trim 25% if extreme greed
+            funding_rate = scanner.fetch_funding_rate(symbol, exchange_name)
+            if funding_rate is not None and funding_rate > 0.0008:   # > 0.08% per 8h
+                return True, f"Funding Overcrowded ({funding_rate*100:.3f}%/8h) — Trim", TRIM_PERCENTAGE
+
             return False, "", 0.0
 
         except Exception as e:
@@ -1568,11 +1649,19 @@ class PaperPortfolio:
         return self.get_portfolio_value()
     
     def execute_buy(self, symbol, weight, details):
-        """Execute buy order (exchange-aware)"""
+        """Execute buy order (exchange-aware, with spread filter)"""
         if symbol in self.positions:
             return False
 
         exchange_name = details.get('exchange', 'binance')
+
+        # ── Spread guard: skip illiquid coins that will eat profits ──
+        book_summary = scanner.fetch_order_book_summary(symbol, exchange_name)
+        if book_summary and book_summary['spread_pct'] > 1.0:
+            event_logger.log('warn',
+                f'Skipping {symbol}: spread too wide ({book_summary["spread_pct"]:.2f}%) — illiquid')
+            return False
+
         price = self.get_current_price(symbol, exchange_name)
         if not price:
             return False
@@ -1587,6 +1676,14 @@ class PaperPortfolio:
         # Safety: never spend more than we actually have
         if self.balance < position_value:
             position_value = self.balance * 0.95
+
+        # ── Liquidity ceiling: never buy more than 10% of available depth ──
+        if book_summary:
+            max_size_usdt = book_summary['bid_depth'] * 0.10
+            if position_value > max_size_usdt and max_size_usdt > 5:
+                event_logger.log('info',
+                    f'{symbol}: capping size ${position_value:.2f} → ${max_size_usdt:.2f} (10% of book depth)')
+                position_value = max_size_usdt
 
         if position_value < 5:
             return False
@@ -1737,12 +1834,13 @@ class AlphaPrime:
         print(f"\n⚡ FAST CHECK - {datetime.now().strftime('%H:%M:%S')}")
         
         # Update global state
-        global_state['balance'] = self.portfolio.balance
-        global_state['positions'] = self.portfolio.positions
-        global_state['portfolio_value'] = self.portfolio.get_portfolio_value()
-        global_state['realized_pnl'] = self.portfolio.realized_pnl
-        global_state['last_fast_update'] = datetime.now().isoformat()
-        
+        with state_lock:
+            global_state['balance'] = self.portfolio.balance
+            global_state['positions'] = self.portfolio.positions
+            global_state['portfolio_value'] = self.portfolio.get_portfolio_value()
+            global_state['realized_pnl'] = self.portfolio.realized_pnl
+            global_state['last_fast_update'] = datetime.now().isoformat()
+
         # Emergency drawdown checks could go here
         # For now, just observe
         print(f"   Portfolio: ${global_state['portfolio_value']:.2f} | Cash: ${self.portfolio.balance:.2f}")
@@ -1754,6 +1852,23 @@ class AlphaPrime:
         """
         print(f"\n⚙️  MEDIUM CHECK - {datetime.now().strftime('%H:%M:%S')}")
         event_logger.log('info', 'Medium cycle: checking exits and trims')
+
+        # ── BTC Velocity Flash-Crash Protection ──────────────────────────
+        # If BTC drops > 1.5% in the last 5 minutes, pre-emptively trim
+        # ALL positions by 25% — correlation goes to 1.0 during crashes.
+        try:
+            btc_5m = scanner.fetch_ohlcv('BTC/USDT', 'binance', '5m', limit=2)
+            if btc_5m and len(btc_5m) >= 2:
+                btc_prev_close = btc_5m[-2][4]
+                btc_curr_close = btc_5m[-1][4]
+                btc_velocity = (btc_curr_close - btc_prev_close) / btc_prev_close
+                if btc_velocity < -0.015:
+                    event_logger.log('sell',
+                        f'🚨 FLASH PROTECT: BTC velocity {btc_velocity*100:.1f}% in 5m — trimming ALL positions 25%')
+                    for sym in list(self.portfolio.positions.keys()):
+                        self.portfolio.execute_trim(sym, 'Flash Crash Protection (BTC -1.5%)', trim_pct=0.25)
+        except Exception as e:
+            event_logger.log('warn', f'BTC velocity check failed: {e}')
         
         # Check exit conditions for all positions
         for symbol in list(self.portfolio.positions.keys()):
@@ -1771,7 +1886,8 @@ class AlphaPrime:
             if should_trim:
                 self.portfolio.execute_trim(symbol, trim_reason, trim_pct=trim_pct)
         
-        global_state['last_medium_update'] = datetime.now().isoformat()
+        with state_lock:
+            global_state['last_medium_update'] = datetime.now().isoformat()
     
     def slow_loop(self):
         """
@@ -1815,11 +1931,12 @@ class AlphaPrime:
             effective_regime = regime
         
         # Update global state with both signals
-        global_state['regime'] = effective_regime
-        global_state['regime_details'] = details
-        global_state['hmm_regime'] = hmm_regime
-        global_state['hmm_confidence'] = hmm_confidence
-        global_state['hmm_state_history'] = hmm_history[-30:] if hmm_history else []
+        with state_lock:
+            global_state['regime'] = effective_regime
+            global_state['regime_details'] = details
+            global_state['hmm_regime'] = hmm_regime
+            global_state['hmm_confidence'] = hmm_confidence
+            global_state['hmm_state_history'] = hmm_history[-30:] if hmm_history else []
         
         event_logger.log('regime',
             f'Regime: {effective_regime} | HMM: {hmm_regime} ({hmm_confidence:.0%} conf) | Rule: {regime} | BTC: ${details.get("btc_price", 0):.0f}',
@@ -1848,6 +1965,48 @@ class AlphaPrime:
         if not ranked:
             print("   ⚠️  No coins to rank")
             return
+
+        # ── Correlation Kill-Switch: Drop correlated positions ───────────────
+        # If two coins have correlation > 0.85, keep the higher-scored one.
+        # Prevents hidden over-leverage (e.g., SOL + JUP + PYTH = 1 bet).
+        try:
+            if len(ranked) >= 3:
+                top_for_corr = ranked[:20]  # check top 20
+                symbols_for_corr = [c['symbol'] for c in top_for_corr]
+                returns_data = {}
+                for coin in top_for_corr:
+                    try:
+                        candles = scanner.fetch_ohlcv(coin['symbol'], coin.get('exchange', 'binance'), '1d', limit=15)
+                        if candles and len(candles) >= 10:
+                            closes = [c[4] for c in candles]
+                            log_ret = np.diff(np.log(closes))
+                            returns_data[coin['symbol']] = log_ret[-10:]
+                    except Exception:
+                        continue
+
+                if len(returns_data) >= 3:
+                    ret_df = pd.DataFrame(returns_data)
+                    corr_matrix = ret_df.corr()
+                    to_remove = set()
+                    score_map = {c['symbol']: c['final_score'] for c in ranked}
+
+                    for i, sym_a in enumerate(corr_matrix.columns):
+                        for j, sym_b in enumerate(corr_matrix.columns):
+                            if i >= j:
+                                continue
+                            if corr_matrix.iloc[i, j] > 0.85:
+                                # Drop the lower-scored one
+                                loser = sym_b if score_map.get(sym_a, 0) >= score_map.get(sym_b, 0) else sym_a
+                                if loser not in to_remove:
+                                    to_remove.add(loser)
+                                    event_logger.log('info',
+                                        f'🔗 CORR_KILL: {sym_a} ↔ {sym_b} corr={corr_matrix.iloc[i,j]:.2f} — dropping {loser}')
+
+                    if to_remove:
+                        ranked = [c for c in ranked if c['symbol'] not in to_remove]
+                        print(f"   🔗 Correlation Kill-Switch removed {len(to_remove)} correlated coins: {to_remove}")
+        except Exception as e:
+            event_logger.log('warn', f'Correlation kill-switch failed: {e}')
         
         # ── Dynamic position count: regime ceiling × HMM confidence × signal quality ──
         hmm_conf   = global_state.get('hmm_confidence', 0.5)
@@ -1866,20 +2025,21 @@ class AlphaPrime:
             trend_status = "✅" if coin['trend_filter'] == 1 else "❌"
             print(f"   {coin['symbol']:<12} {coin['final_score']:>9.4f} {coin['momentum_7d']:>7.1%} {coin['momentum_24h']:>7.1%} {coin['volatility']:>7.4f} {trend_status}")
 
-        global_state['top_coins'] = top_n
+        with state_lock:
+            global_state['top_coins'] = top_n
 
-        # ── Full watchlist: top 15 for dashboard (more than just trading slots) ──
-        # This is what shows in Alpha Rankings. Includes coins ranked beyond active_n
-        # so you can see potential re-entries (like PIPPIN bouncing back at rank #7).
-        WATCHLIST_SIZE = 15
-        top_symbols_set = {c['symbol'] for c in top_n}
-        watchlist = []
-        for coin in ranked[:WATCHLIST_SIZE]:
-            watchlist.append({
-                **coin,
-                'is_selected': coin['symbol'] in top_symbols_set  # True = in active trading shortlist
-            })
-        global_state['watchlist'] = watchlist
+            # ── Full watchlist: top 15 for dashboard (more than just trading slots) ──
+            # This is what shows in Alpha Rankings. Includes coins ranked beyond active_n
+            # so you can see potential re-entries (like PIPPIN bouncing back at rank #7).
+            WATCHLIST_SIZE = 15
+            top_symbols_set = {c['symbol'] for c in top_n}
+            watchlist = []
+            for coin in ranked[:WATCHLIST_SIZE]:
+                watchlist.append({
+                    **coin,
+                    'is_selected': coin['symbol'] in top_symbols_set
+                })
+            global_state['watchlist'] = watchlist
 
         # Log top coins as signal events
         for coin in top_n:
@@ -1895,8 +2055,9 @@ class AlphaPrime:
             print(f"   {coin['symbol']:<12} → {coin['weight']:>6.1%}")
         
         # Update optimizer state in global
-        global_state['optimizer_weights'] = {c['symbol']: round(c['weight'], 4) for c in top_n_weighted}
-        global_state['optimizer_active'] = HMM_AVAILABLE
+        with state_lock:
+            global_state['optimizer_weights'] = {c['symbol']: round(c['weight'], 4) for c in top_n_weighted}
+            global_state['optimizer_active'] = HMM_AVAILABLE
         
         # Position count already controls regime risk — no need to also cut weights.
         # (Regime multiplier removed: it was causing ~70% of capital to idle in cash)
@@ -1914,15 +2075,42 @@ class AlphaPrime:
             if symbol not in top_symbols:
                 self.portfolio.execute_sell(symbol, "Rotated out of Top N")
         
-        # Enter new positions in Top N
+        # Enter new positions in Top N (Kelly-scaled)
+        kelly_stats = trade_analyzer.get_kelly_stats()
+        if kelly_stats:
+            win_rate, wl_ratio, n_trades = kelly_stats
+            kelly_f = ((win_rate * wl_ratio) - (1 - win_rate)) / wl_ratio
+            kelly_f = max(0.05, min(kelly_f, 1.0))  # Clamp [5%, 100%]
+            half_kelly = kelly_f * 0.5               # Half-Kelly (safer)
+            print(f"   🎲 Kelly Fraction: {half_kelly:.1%} (win: {win_rate:.0%}, W/L: {wl_ratio:.2f}, trades: {n_trades})")
+        else:
+            half_kelly = 1.0   # No history → use full optimizer weight
+
         for coin in top_n_weighted:
             if coin['symbol'] not in self.portfolio.positions:
-                self.portfolio.execute_buy(coin['symbol'], coin['weight'], coin)
+                kelly_weight = coin['weight'] * half_kelly
+                self.portfolio.execute_buy(coin['symbol'], kelly_weight, coin)
         
         # Save equity curve point
         self.analytics.save_equity_point()
         
-        global_state['last_slow_update'] = datetime.now().isoformat()
+        # ── Post-Trade Feedback Loop ─────────────────────────────────
+        try:
+            adjustments = trade_analyzer.analyze_closed_trades()
+            if adjustments:
+                import builtins  # to modify module-level constants
+                for param, new_val in adjustments.items():
+                    old_val = globals().get(param)
+                    if old_val is not None and old_val != new_val:
+                        globals()[param] = new_val
+                        event_logger.log('info',
+                            f'🧠 FEEDBACK: {param} adjusted {old_val} → {new_val}')
+                        print(f"   🧠 Feedback Loop: {param} {old_val} → {new_val}")
+        except Exception as e:
+            event_logger.log('warn', f'Trade feedback loop failed: {e}')
+
+        with state_lock:
+            global_state['last_slow_update'] = datetime.now().isoformat()
         
         # Summary
         portfolio_value = self.portfolio.get_portfolio_value()
