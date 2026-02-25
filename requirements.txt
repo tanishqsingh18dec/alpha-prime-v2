@@ -6,3 +6,7 @@ requests>=2.30.0
 hmmlearn>=0.3.0
 scipy>=1.11.0
 scikit-learn>=1.3.0
+# Optional: FinBERT sentiment (Phase 3) — ~2GB download on first run
+# Install with: pip install transformers torch
+# transformers>=4.35.0
+# torch>=2.1.0

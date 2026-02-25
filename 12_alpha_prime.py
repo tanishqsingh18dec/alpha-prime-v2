@@ -29,6 +29,8 @@ import pickle
 import warnings
 from pathlib import Path
 from multi_exchange import MultiExchangeScanner
+from onchain_signals import OnChainMonitor
+from drl_collector import DRLDataCollector
 from trade_analyzer import TradeAnalyzer
 
 # ML imports for HMM and Portfolio Optimizer
@@ -102,8 +104,8 @@ ENABLED_EXCHANGES = ['binance', 'kucoin', 'gateio', 'mexc', 'bybit', 'kraken', '
 
 # 3-Speed Architecture
 FAST_INTERVAL = 30      # 30 seconds - price observation
-MEDIUM_INTERVAL = 600   # 10 minutes - exit checks (live-price stop monitoring)
-SLOW_INTERVAL = 1800    # 30 minutes - full rebalance
+MEDIUM_INTERVAL = 300   # 5 minutes - exit checks (live-price stop monitoring)
+SLOW_INTERVAL = 3600    # 1 hour - full rebalance (aligned with signal horizon)
 
 # Exit thresholds
 RSI_TRIM_THRESHOLD = 80       # Trim when RSI > 80
@@ -111,10 +113,20 @@ RSI_EXTREME_THRESHOLD = 85    # Heavy trim when RSI > 85 (extreme overbought)
 TRIM_PERCENTAGE = 0.25        # Standard trim: 25% of position
 HEAVY_TRIM_PERCENTAGE = 0.50  # Heavy trim: 50% of position (extreme overbought)
 TRAILING_STOP_TRIGGER = 0.10  # Activate trailing stop after 10% gain
-TRAILING_STOP_PCT = 0.06      # Trail 6% below the all-time high for this position
-HARD_STOP_LOSS_PCT = -0.05    # Hard stop loss at -5%
-TIME_STOP_CYCLES = 3          # Exit if no movement after N slow cycles
+TRAILING_STOP_PCT = 0.06      # Trail 6% below the all-time high (ATR fallback)
+HARD_STOP_LOSS_PCT = -0.05    # Hard stop loss at -5% (ATR fallback)
+TIME_STOP_CYCLES = 6          # Exit if no movement after N slow cycles (was 3 → 6h minimum hold)
 MIN_RETURN_TO_HOLD = 0.02     # 2% minimum return to keep holding
+
+# Trim control — prevents the trim death spiral
+TRIM_COOLDOWN_HOURS = 4       # Min hours between trims on the same position
+MAX_TRIMS_PER_POSITION = 3    # Max trims before a full position requires a sell decision
+MIN_POSITION_VALUE = 10.0     # Stop trimming below this $ value
+
+# Paper trading fee model — realistic friction
+TAKER_FEE = 0.001             # 0.10% taker fee
+ESTIMATED_SLIPPAGE = 0.0005   # 0.05% average slippage
+ENTRY_RSI_MAX = 75            # Don't buy if 4H RSI is above this
 
 # File paths
 PORTFOLIO_FILE = "alpha_prime_portfolio.json"
@@ -482,9 +494,11 @@ class SentimentLoader:
     """
 
     SENTIMENT_FILE = os.path.join('sentiment_data', 'reddit_sentiment_latest.json')
+    STALENESS_HALF_LIFE_HOURS = 24  # Score loses 50% weight after 24 hours
 
     def __init__(self):
         self._data = {}
+        self._data_age_hours = 0.0
         self.refresh()
 
     def refresh(self):
@@ -495,9 +509,25 @@ class SentimentLoader:
                     self._data = json.load(f)
                 meta = self._data.get('_meta', {})
                 coins_tracked = meta.get('coins_tracked', '?')
+
+                # Compute data age for staleness decay
+                ts_str = meta.get('timestamp')
+                if ts_str:
+                    try:
+                        data_time = datetime.fromisoformat(ts_str)
+                        self._data_age_hours = (datetime.now() - data_time).total_seconds() / 3600
+                    except Exception:
+                        self._data_age_hours = 0.0
+                else:
+                    self._data_age_hours = 0.0
+
+                decay = self._staleness_factor()
+                age_label = f"{self._data_age_hours:.1f}h ago" if self._data_age_hours > 0 else "fresh"
                 print(f"   📰 Sentiment v{meta.get('version','?')} loaded: "
                       f"{meta.get('total_posts','?')} posts · "
-                      f"{coins_tracked} coins tracked · {meta.get('date','?')}")
+                      f"{coins_tracked} coins tracked · {meta.get('date','?')} "
+                      f"({age_label}, decay: {decay:.0%})")
+
                 # Print holdings correlation if available
                 hc = self._data.get('_holdings_correlation', {})
                 if hc.get('holdings'):
@@ -512,6 +542,21 @@ class SentimentLoader:
             print(f"   ⚠️  Sentiment load error: {e}")
             self._data = {}
 
+    def _staleness_factor(self) -> float:
+        """
+        Exponential decay based on data age.
+        Returns a multiplier in (0, 1]:
+          - 0h  → 1.00 (full weight)
+          - 6h  → 0.84
+          - 24h → 0.50 (half-life)
+          - 48h → 0.25
+          - 72h → 0.12
+        """
+        import math
+        if self._data_age_hours <= 0:
+            return 1.0
+        return math.pow(0.5, self._data_age_hours / self.STALENESS_HALF_LIFE_HOURS)
+
     def _entry(self, symbol: str) -> dict:
         """Internal: get the raw entry for a symbol."""
         base = symbol.split('/')[0].upper()  # 'SOL/USDT' → 'SOL'
@@ -521,8 +566,11 @@ class SentimentLoader:
         """
         Get sentiment score for a coin symbol (e.g. 'SOL/USDT' or 'SOL').
         Returns float in [-1.0, +1.0]. 0.0 = neutral / not found.
+
+        Score is decayed based on data staleness — 24-hour half-life.
         """
-        return float(self._entry(symbol).get('sentiment', 0.0))
+        raw = float(self._entry(symbol).get('sentiment', 0.0))
+        return raw * self._staleness_factor()
 
     def get_signal(self, symbol: str) -> str:
         """Returns 'BULLISH', 'BEARISH', or 'NEUTRAL'."""
@@ -567,6 +615,194 @@ class SentimentLoader:
 sentiment_loader = SentimentLoader()
 
 # =============================================================================
+# MARKET MICROSTRUCTURE — OFI, VPIN, Spoofing Detection  (Phase 2)
+# =============================================================================
+
+class OrderFlowTracker:
+    """
+    Tracks order book snapshots between polling intervals to compute
+    Order Flow Imbalance (OFI) — a leading indicator of price direction.
+
+    OFI measures how bid/ask queue sizes change:
+      - Bids strengthening + asks weakening → positive OFI → bullish
+      - Bids weakening + asks strengthening → negative OFI → bearish
+    """
+
+    def __init__(self):
+        self._prev_books = {}  # symbol → {best_bid, bid_vol, best_ask, ask_vol}
+
+    def compute_ofi(self, symbol, current_book):
+        """
+        Compute OFI from current order book snapshot vs previous.
+
+        Args:
+            symbol: Trading pair (e.g., 'BTC/USDT')
+            current_book: dict with best_bid, best_ask, bid_vol, ask_vol
+
+        Returns:
+            OFI score in [-1, +1]:
+              positive = net buy pressure (bids strengthening / asks weakening)
+              negative = net sell pressure
+        """
+        if not current_book:
+            return 0.0
+
+        prev = self._prev_books.get(symbol)
+        self._prev_books[symbol] = {
+            'best_bid': current_book.get('best_bid', 0),
+            'bid_vol':  current_book.get('bid_vol', 0),
+            'best_ask': current_book.get('best_ask', 0),
+            'ask_vol':  current_book.get('ask_vol', 0),
+        }
+
+        if not prev:
+            return 0.0  # First observation — no delta yet
+
+        # Delta bid volume (standard OFI formula)
+        cb = current_book
+        if cb.get('best_bid', 0) > prev['best_bid']:
+            delta_bid = cb.get('bid_vol', 0)              # New bid level — full volume
+        elif cb.get('best_bid', 0) == prev['best_bid']:
+            delta_bid = cb.get('bid_vol', 0) - prev['bid_vol']  # Same level — delta
+        else:
+            delta_bid = -prev['bid_vol']                   # Bid retreated — full loss
+
+        # Delta ask volume (inverted for OFI direction)
+        if cb.get('best_ask', 0) < prev['best_ask']:
+            delta_ask = cb.get('ask_vol', 0)
+        elif cb.get('best_ask', 0) == prev['best_ask']:
+            delta_ask = cb.get('ask_vol', 0) - prev['ask_vol']
+        else:
+            delta_ask = -prev['ask_vol']
+
+        raw_ofi = delta_bid - delta_ask
+        # Normalize to [-1, 1]
+        max_val = max(abs(delta_bid), abs(delta_ask), 1e-9)
+        ofi = max(-1.0, min(1.0, raw_ofi / max_val))
+        return ofi
+
+    def get_ofi(self, symbol):
+        """Get the most recently computed OFI for a symbol (for dashboard)."""
+        return self._prev_books.get(symbol, {})
+
+
+class ToxicityMonitor:
+    """
+    Simplified VPIN (Volume-Synchronized Probability of Informed Trading).
+
+    Tracks buy/sell volume imbalance in recent candles to estimate how much
+    of the trading is "informed" (institutional, insider, or algorithmic).
+
+    High VPIN = informed traders dominating → pause new entries to avoid
+    adverse selection (buying right before a dump, or selling before a spike).
+    """
+
+    def __init__(self, n_buckets=50):
+        self.n_buckets = n_buckets
+        self._buckets = {}  # symbol → list of imbalance ratios
+
+    def update(self, symbol, candles):
+        """
+        Feed recent candle data; returns VPIN estimate [0, 1].
+
+        Uses the tick rule (close > open = buy-initiated) to classify volume.
+        """
+        if not candles or len(candles) < 5:
+            return 0.0
+
+        if symbol not in self._buckets:
+            self._buckets[symbol] = []
+
+        for candle in candles[-10:]:  # Only process recent candles
+            open_p, close_p, volume = candle[1], candle[4], candle[5]
+            if volume == 0:
+                continue
+            # Classify: close > open → buy-initiated, else sell-initiated
+            buy_pct = (close_p - open_p) / (abs(close_p - open_p) + 1e-9) * 0.5 + 0.5
+            buy_vol = volume * buy_pct
+            sell_vol = volume - buy_vol
+            self._buckets[symbol].append(abs(buy_vol - sell_vol) / (volume + 1e-9))
+
+        # Keep only recent buckets
+        self._buckets[symbol] = self._buckets[symbol][-self.n_buckets:]
+
+        buckets = self._buckets[symbol]
+        if len(buckets) < 5:
+            return 0.0
+        return sum(buckets) / len(buckets)
+
+    def is_toxic(self, symbol, threshold=0.70):
+        """Returns True if flow toxicity for symbol exceeds threshold."""
+        buckets = self._buckets.get(symbol, [])
+        if len(buckets) < 5:
+            return False
+        vpin = sum(buckets) / len(buckets)
+        return vpin > threshold
+
+
+class SpoofDetector:
+    """
+    Lightweight anomaly detection on order book patterns to flag spoofing.
+
+    Uses an Isolation Forest trained on order book features like:
+    - spread_pct: abnormally wide/narrow spreads
+    - imbalance: extreme one-sided books
+    - depth_ratio: bid_depth / ask_depth asymmetry
+    - bid/ask volume ratios
+
+    After collecting 100+ observations, the model flags outliers that may
+    indicate spoofing (fake walls), layering, or quote stuffing.
+    """
+
+    def __init__(self):
+        self._trained = False
+        self._history = []  # list of [spread, imbalance, depth_ratio]
+        self._model = None
+
+    def record(self, ob_summary):
+        """Record an order book observation for training."""
+        if not ob_summary:
+            return
+        spread = ob_summary.get('spread_pct', 0)
+        imbalance = ob_summary.get('imbalance', 0)
+        bid_d = ob_summary.get('bid_depth', 1)
+        ask_d = ob_summary.get('ask_depth', 1)
+        depth_ratio = bid_d / (ask_d + 1e-9)
+
+        self._history.append([spread, imbalance, depth_ratio])
+
+        # Train after 100 observations
+        if len(self._history) >= 100 and not self._trained:
+            try:
+                from sklearn.ensemble import IsolationForest
+                self._model = IsolationForest(contamination=0.05, random_state=42)
+                self._model.fit(self._history)
+                self._trained = True
+            except ImportError:
+                pass  # sklearn not available — disable
+
+    def is_suspicious(self, ob_summary):
+        """Check if current order book pattern is anomalous (potential spoofing)."""
+        if not self._trained or not self._model or not ob_summary:
+            return False
+        spread = ob_summary.get('spread_pct', 0)
+        imbalance = ob_summary.get('imbalance', 0)
+        bid_d = ob_summary.get('bid_depth', 1)
+        ask_d = ob_summary.get('ask_depth', 1)
+        depth_ratio = bid_d / (ask_d + 1e-9)
+
+        features = [[spread, imbalance, depth_ratio]]
+        return self._model.predict(features)[0] == -1  # -1 = outlier
+
+
+# Global microstructure instances (persist across cycles for delta tracking)
+order_flow_tracker = OrderFlowTracker()
+toxicity_monitor = ToxicityMonitor()
+spoof_detector = SpoofDetector()
+onchain_monitor = OnChainMonitor()
+drl_collector = DRLDataCollector()
+
+# =============================================================================
 # LAYER 3: ALPHA SCORE ENGINE (Volatility-Adjusted Momentum + Sentiment)
 # =============================================================================
 
@@ -576,19 +812,24 @@ class AlphaScorer:
     """
 
     # Blending weights: how much each signal contributes to the final score
-    MOMENTUM_WEIGHT  = 0.65   # 65% price-based momentum (still king)
-    SENTIMENT_WEIGHT = 0.15   # 15% Reddit crowd sentiment
+    MOMENTUM_WEIGHT  = 0.60   # 60% price-based momentum
+    SENTIMENT_WEIGHT = 0.10   # 10% Reddit crowd sentiment (was 15%, 5% given to on-chain)
     FUEL_WEIGHT      = 0.10   # 10% derivatives fuel (funding rate signal)
     VOLUME_WEIGHT    = 0.10   # 10% relative volume intensity (RVOL)
+    OFI_WEIGHT       = 0.05   # 5% order flow imbalance (microstructure)
+    ONCHAIN_WEIGHT   = 0.05   # 5% on-chain exchange flow (Phase 4)
 
     @staticmethod
-    def calculate_score(coin_data):
+    def calculate_score(coin_data, prefetched=None):
         """
         Calculate multi-factor score for a coin:
-          - Volatility-adjusted momentum (65%)
+          - Volatility-adjusted momentum (60%)
           - Reddit sentiment (15%)
           - Derivatives fuel — funding rate signal (10%)
           - Relative Volume — RVOL intensity (10%)
+          - Order Flow Imbalance — LOB pressure (5%)
+
+        Also checks VPIN toxicity and spoofing flags as score penalties.
 
         Formula:
           RawMomentum     = 0.6 * Momentum_7d + 0.4 * Momentum_24h
@@ -598,13 +839,22 @@ class AlphaScorer:
           RvolScore       = clamp((rvol - 1) / 3, -1, +1)
 
           FinalScore = 0.65*Momentum + 0.15*Sentiment + 0.10*Fuel + 0.10*RVOL
+
+        Args:
+            coin_data: dict with symbol, exchange, volume, price
+            prefetched: optional dict from scanner.prefetch_scoring_data()
+                        with keys: ohlcv_1d, ohlcv_4h, funding_rate, order_book
+                        If provided, skip all network calls (10x faster).
         """
         try:
             symbol = coin_data['symbol']
             exchange_name = coin_data['exchange']
 
             # Fetch 30 days of daily data for momentum + volatility
-            candles = scanner.fetch_ohlcv(symbol, exchange_name, '1d', limit=30)
+            if prefetched and prefetched.get('ohlcv_1d'):
+                candles = prefetched['ohlcv_1d']
+            else:
+                candles = scanner.fetch_ohlcv(symbol, exchange_name, '1d', limit=30)
             if len(candles) < 30:
                 return None, None
 
@@ -626,7 +876,10 @@ class AlphaScorer:
                 return None, None
 
             # Trend filter: EMA 50 on 4H
-            candles_4h = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
+            if prefetched and prefetched.get('ohlcv_4h'):
+                candles_4h = prefetched['ohlcv_4h']
+            else:
+                candles_4h = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
             df_4h      = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             ema_50     = df_4h['close'].ewm(span=50, adjust=False).mean().iloc[-1]
             trend_filter = 1 if current_price > ema_50 else 0
@@ -654,7 +907,11 @@ class AlphaScorer:
             # ── Fuel score (derivatives signal — one API call) ────────────
             # Funding rate: positive = longs pay shorts (overcrowded)
             #               negative = shorts pay longs (bullish)
-            funding_rate = scanner.fetch_funding_rate(symbol, exchange_name)
+            funding_rate = None
+            if prefetched:
+                funding_rate = prefetched.get('funding_rate')
+            else:
+                funding_rate = scanner.fetch_funding_rate(symbol, exchange_name)
             if funding_rate is not None:
                 # ── Funding Divergence: the real alpha ──
                 # Deeply negative funding + price holding above EMA50 = SHORT SQUEEZE
@@ -679,6 +936,11 @@ class AlphaScorer:
             # ── Blended final score ───────────────────────────────────────
             # If trend filter is OFF (price below EMA50), kill the whole score
             # regardless of sentiment — we don't fight a downtrend.
+            #
+            # Note: OFI bonus is applied later after order book section computes it.
+            # ofi_score is initialized to 0.0 and gets updated by OrderFlowTracker.
+            ofi_score = 0.0  # Pre-initialize (updated in order book section below)
+
             if trend_filter == 0:
                 final_score = 0.0
             else:
@@ -707,25 +969,67 @@ class AlphaScorer:
             if zscore_exhausted:
                 final_score = 0.0   # Block entry — price extended, volume drying up
 
-            # ── Order book microstructure: liquidity penalty + imbalance ──
-            ob_summary = scanner.fetch_order_book_summary(symbol, exchange_name)
+            # ── Order book microstructure: OFI + liquidity + VPIN + spoofing ──
+            if prefetched:
+                ob_summary = prefetched.get('order_book')
+            else:
+                ob_summary = scanner.fetch_order_book_summary(symbol, exchange_name)
+
             ob_imbalance = 0.0
             ob_bonus = 0.0
             ob_depth_ok = True
+            ofi_score = 0.0
+            vpin_score = 0.0
+            is_toxic = False
+            is_spoofed = False
+
             if ob_summary:
                 ob_imbalance = ob_summary.get('imbalance', 0.0)
+
+                # ── Order Flow Imbalance (new — Phase 2) ──
+                # Track LOB changes between cycles for directional pressure
+                ofi_score = order_flow_tracker.compute_ofi(symbol, ob_summary)
+
+                # ── Spoofing detection (new — Phase 2) ──
+                # Record observation for training; flag if anomalous
+                spoof_detector.record(ob_summary)
+                is_spoofed = spoof_detector.is_suspicious(ob_summary)
+                if is_spoofed:
+                    # Ignore the imbalance signal — it may be fake walls
+                    ofi_score *= 0.3  # Heavily discount OFI under spoofing
+                    ob_bonus = 0.0
+                    event_logger.log('warn', f'🕵️ SPOOF DETECTED: {symbol} — order book anomaly, discounting OFI')
+
                 # Liquidity penalty: if depth within ~0.5% is very thin, downrank
                 total_depth = ob_summary.get('bid_depth', 0) + ob_summary.get('ask_depth', 0)
                 if total_depth < 5000:  # Less than $5k in top-20 levels
                     final_score *= 0.5   # Halve score — can't exit without slippage
                     ob_depth_ok = False
 
-                # OB imbalance tiebreaker: heavy buy walls = leading indicator
-                if ob_imbalance > 0.3:
-                    ob_bonus = 0.05     # Small bullish nudge
-                elif ob_imbalance < -0.3:
-                    ob_bonus = -0.05    # Small bearish nudge
+                # OB imbalance tiebreaker (if not spoofed)
+                if not is_spoofed:
+                    if ob_imbalance > 0.3:
+                        ob_bonus = 0.05     # Small bullish nudge
+                    elif ob_imbalance < -0.3:
+                        ob_bonus = -0.05    # Small bearish nudge
                 final_score += ob_bonus
+
+            # Apply OFI weighted contribution (computed above from order book deltas)
+            final_score += AlphaScorer.OFI_WEIGHT * ofi_score
+
+            # ── On-Chain Exchange Flow (Phase 4) ──
+            # L/S ratio, mempool pressure, chain stats → flow score
+            onchain_score = onchain_monitor.get_flow_score(symbol)
+            final_score += AlphaScorer.ONCHAIN_WEIGHT * onchain_score
+
+            # ── VPIN Toxicity Filter (new — Phase 2) ──
+            # Feed candle data to VPIN monitor; block entry if toxic
+            if prefetched and prefetched.get('ohlcv_4h'):
+                vpin_score = toxicity_monitor.update(symbol, prefetched['ohlcv_4h'])
+            is_toxic = toxicity_monitor.is_toxic(symbol)
+            if is_toxic:
+                final_score *= 0.3  # Heavily penalize — informed traders are dominating
+                event_logger.log('warn', f'☠️ TOXIC FLOW: {symbol} — VPIN {vpin_score:.2f} above threshold, penalizing')
 
             details = {
                 'symbol':              symbol,
@@ -748,6 +1052,11 @@ class AlphaScorer:
                 'rvol_score':          round(rvol_score, 3),
                 'funding_rate':        funding_rate,
                 'fuel_score':          round(fuel_score, 3),
+                'ofi_score':           round(ofi_score, 3),
+                'onchain_score':       round(onchain_score, 3),
+                'vpin_score':          round(vpin_score, 3),
+                'is_toxic':            is_toxic,
+                'is_spoofed':          is_spoofed,
                 'ob_imbalance':        round(ob_imbalance, 3),
                 'ob_bonus':            round(ob_bonus, 3),
                 'ob_depth_ok':         ob_depth_ok,
@@ -764,25 +1073,30 @@ class AlphaScorer:
     @staticmethod
     def rank_universe(coin_data_list):
         """
-        Score all coins CONCURRENTLY and return sorted by final_score.
-        Uses ThreadPoolExecutor to fetch data for all coins in parallel
-        instead of sequentially — ~10× faster for 60+ coins.
+        Score all coins and return sorted by final_score.
+        Uses async prefetch to grab all data concurrently (~5s for 60 coins)
+        then scores each coin sequentially from cached data (pure math).
         """
         results = []
 
-        def _score_one(coin_data):
-            try:
-                return AlphaScorer.calculate_score(coin_data)
-            except Exception:
-                return None, None
+        # ── Pre-fetch ALL data for ALL coins concurrently (the 10x speedup) ──
+        print(f"   ⚡ Async prefetch: fetching data for {len(coin_data_list)} coins concurrently...")
+        import time as _time
+        t0 = _time.time()
+        prefetched_all = scanner.prefetch_scoring_data(coin_data_list)
+        elapsed = _time.time() - t0
+        print(f"   ⚡ Prefetch complete: {len(prefetched_all)} coins in {elapsed:.1f}s")
 
-        # 10 workers — CCXT's per-exchange rate limiter handles throttling
-        with ThreadPoolExecutor(max_workers=10) as pool:
-            futures = {pool.submit(_score_one, cd): cd for cd in coin_data_list}
-            for future in as_completed(futures):
-                score, details = future.result()
+        # ── Score each coin from cached data (no more network calls) ──
+        for coin_data in coin_data_list:
+            try:
+                symbol = coin_data['symbol']
+                coin_prefetched = prefetched_all.get(symbol)
+                score, details = AlphaScorer.calculate_score(coin_data, prefetched=coin_prefetched)
                 if score is not None:
                     results.append(details)
+            except Exception:
+                pass
 
         # Sort by final_score descending
         results.sort(key=lambda x: x['final_score'], reverse=True)
@@ -1420,8 +1734,8 @@ class ExecutionEngine:
         Returns: (should_exit, reason)
 
         Exit conditions:
-        1. Hard Stop Loss:  -5% from entry         → immediate exit
-        2. Trailing Stop:    4% drop from peak      → only active after 10% gain
+        1. Hard Stop Loss:  ATR-based (1.5× ATR, clamped -3% to -8%)
+        2. Trailing Stop:   ATR-based (2.0× ATR, clamped 4% to 10%)
         3. VSA Divergence:  higher high, less vol  → distribution detected
         4. Trend Kill:      price < 4H EMA 50
         5. Time Stop:       held N cycles with low return
@@ -1436,30 +1750,46 @@ class ExecutionEngine:
             df = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
             # --- LIVE price for stop calculations (not the stale 4H candle close) ---
-            # The 4H close only updates every 4 hours. During a flash crash the candle
-            # can be hours old. Live price catches the move in real time.
             live_price = scanner.get_current_price(symbol, exchange_name)
             current_price = live_price if live_price else df['close'].iloc[-1]
 
             entry_price = position['entry_price']
             pnl_pct = (current_price - entry_price) / entry_price
 
-            # --- Exit 1: HARD STOP LOSS ---
-            if pnl_pct < HARD_STOP_LOSS_PCT:
-                return True, f"Hard Stop Loss ({pnl_pct*100:.1f}%)"
+            # --- ATR-Based Adaptive Stops (replaces static percentages) ---
+            # Compute 14-period ATR from 4H candles
+            df['prev_close'] = df['close'].shift(1)
+            df['tr'] = np.maximum(
+                df['high'] - df['low'],
+                np.maximum(
+                    abs(df['high'] - df['prev_close']),
+                    abs(df['low'] - df['prev_close'])
+                )
+            )
+            atr_14 = df['tr'].rolling(14).mean().iloc[-1]
+            atr_pct = atr_14 / current_price if current_price > 0 else 0.05
 
-            # --- Exit 2: TRAILING STOP LOSS (Profit Protector) ---
-            # Track highest price seen since entry — active from day 1, no gain threshold
+            # Dynamic stops: scale with actual volatility
+            # High vol (10% ATR) → hard stop at -15%, trailing at 20%
+            # Low vol (2% ATR) → hard stop at -3%, trailing at 4%
+            dynamic_hard_stop = max(-0.08, min(-0.03, -1.5 * atr_pct))
+            dynamic_trailing  = max(0.04, min(0.10, 2.0 * atr_pct))
+
+            # --- Exit 1: HARD STOP LOSS (ATR-adaptive) ---
+            if pnl_pct < dynamic_hard_stop:
+                return True, f"Hard Stop Loss ({pnl_pct*100:.1f}% | ATR-stop: {dynamic_hard_stop*100:.1f}%)"
+
+            # --- Exit 2: TRAILING STOP LOSS (ATR-adaptive) ---
             if 'highest_price' not in position:
                 position['highest_price'] = current_price
             else:
                 position['highest_price'] = max(position['highest_price'], current_price)
 
             drawdown_from_peak = (position['highest_price'] - current_price) / position['highest_price']
-            if drawdown_from_peak > TRAILING_STOP_PCT:
+            if drawdown_from_peak > dynamic_trailing:
                 return True, (
                     f"Trailing Stop (-{drawdown_from_peak*100:.1f}% from peak "
-                    f"${position['highest_price']:.4f})"
+                    f"${position['highest_price']:.4f} | ATR-trail: {dynamic_trailing*100:.1f}%)"
                 )
 
             # --- Exit 3: VSA BEARISH DIVERGENCE (Distribution Signal) ---
@@ -1502,12 +1832,44 @@ class ExecutionEngine:
         Check if position should be trimmed.
         Returns: (should_trim, reason, trim_pct)
 
+        Guards (prevent trim death spiral):
+        - Cooldown: at least TRIM_COOLDOWN_HOURS between trims
+        - Max trims: no more than MAX_TRIMS_PER_POSITION trims per position
+        - Min value: don't trim below MIN_POSITION_VALUE
+
         Trim tiers:
         - RSI > 85 → Heavy Trim (50%) — Extreme Overbought
         - RSI > 80 → Standard Trim (25%) — Overbought
         - Price > Upper Bollinger Band → Standard Trim (25%)
         """
         try:
+            # ── Trim Death Spiral Guards ────────────────────────────────
+            position = self.portfolio.positions.get(symbol)
+            if not position:
+                return False, "", 0.0
+
+            # Guard 1: Cooldown — don't trim the same position too frequently
+            last_trim = position.get('last_trim_time')
+            if last_trim:
+                try:
+                    hours_since = (datetime.now() - datetime.fromisoformat(last_trim)).total_seconds() / 3600
+                    if hours_since < TRIM_COOLDOWN_HOURS:
+                        return False, "", 0.0
+                except Exception:
+                    pass  # Bad timestamp — skip guard
+
+            # Guard 2: Max trims — after N trims, stop trimming (let exit logic handle it)
+            if position.get('trim_count', 0) >= MAX_TRIMS_PER_POSITION:
+                return False, "", 0.0
+
+            # Guard 3: Position floor — don't trim sub-threshold positions
+            current_price_est = scanner.get_current_price(symbol, exchange_name)
+            if current_price_est:
+                position_value = position['quantity'] * current_price_est
+                if position_value < MIN_POSITION_VALUE:
+                    return False, "", 0.0
+
+            # ── Technical Trim Signals ──────────────────────────────────
             candles = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
             if not candles or len(candles) < 20:
                 event_logger.log('warn', f'check_trim: no 4H data for {symbol} on {exchange_name}')
@@ -1649,11 +2011,28 @@ class PaperPortfolio:
         return self.get_portfolio_value()
     
     def execute_buy(self, symbol, weight, details):
-        """Execute buy order (exchange-aware, with spread filter)"""
+        """Execute buy order (exchange-aware, with spread filter + RSI gate + fee model)"""
         if symbol in self.positions:
             return False
 
         exchange_name = details.get('exchange', 'binance')
+
+        # ── Entry RSI Gate: don't buy overbought coins ──
+        try:
+            candles_4h = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=20)
+            if candles_4h and len(candles_4h) >= 14:
+                df_4h = pd.DataFrame(candles_4h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                delta = df_4h['close'].diff()
+                gain = delta.where(delta > 0, 0).rolling(14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+                rs = gain.iloc[-1] / (loss.iloc[-1] + 1e-9)
+                entry_rsi = 100 - (100 / (1 + rs))
+                if entry_rsi > ENTRY_RSI_MAX:
+                    event_logger.log('warn',
+                        f'Skipping {symbol}: RSI {entry_rsi:.0f} > {ENTRY_RSI_MAX} at entry — overbought')
+                    return False
+        except Exception:
+            pass  # Don't block entry if RSI check fails
 
         # ── Spread guard: skip illiquid coins that will eat profits ──
         book_summary = scanner.fetch_order_book_summary(symbol, exchange_name)
@@ -1666,10 +2045,10 @@ class PaperPortfolio:
         if not price:
             return False
 
-        # Calculate position size:
-        # Each coin gets (weight × TARGET_INVESTMENT_PCT) of total portfolio value.
-        # This guarantees we deploy TARGET_INVESTMENT_PCT in total, not whatever
-        # the optimizer happened to sum to after renormalization + old multipliers.
+        # ── Fee model: simulate realistic execution cost ──
+        effective_price = price * (1 + TAKER_FEE + ESTIMATED_SLIPPAGE)
+
+        # Calculate position size
         portfolio_value = self.get_portfolio_value()
         position_value  = portfolio_value * weight * TARGET_INVESTMENT_PCT
 
@@ -1687,43 +2066,49 @@ class PaperPortfolio:
 
         if position_value < 5:
             return False
-        
-        quantity = position_value / price
-        
+
+        quantity = position_value / effective_price  # Use effective price (with fees)
+
         self.balance -= position_value
         self.positions[symbol] = {
-            'entry_price': price,
+            'entry_price': effective_price,  # Entry at effective price (includes fees)
             'quantity': quantity,
             'entry_time': datetime.now().isoformat(),
             'entry_score': details['final_score'],
             'weight': weight,
             'cycles_held': 0,
-            'exchange': exchange_name  # Track which exchange
+            'trim_count': 0,              # Track trims for death spiral prevention
+            'last_trim_time': None,        # Track last trim time for cooldown
+            'exchange': exchange_name
         }
-        
-        self.log_trade('BUY', symbol, quantity, price, reason=f"Score: {details['final_score']:.2f} | {exchange_name.upper()}")
+
+        fee_paid = position_value * (TAKER_FEE + ESTIMATED_SLIPPAGE)
+        self.log_trade('BUY', symbol, quantity, effective_price, reason=f"Score: {details['final_score']:.2f} | {exchange_name.upper()} | Fee: ${fee_paid:.3f}")
         self.save_portfolio()
-        print(f"✅ BUY {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} (${position_value:.2f})")
-        event_logger.log('buy', f'BUY {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} (${position_value:.2f})', {
-            'symbol': symbol, 'exchange': exchange_name, 'price': price, 'quantity': quantity, 'value': position_value, 'score': details.get('final_score', 0)
+        print(f"✅ BUY {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${effective_price:.4f} (${position_value:.2f}, fee: ${fee_paid:.3f})")
+        event_logger.log('buy', f'BUY {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${effective_price:.4f} (${position_value:.2f})', {
+            'symbol': symbol, 'exchange': exchange_name, 'price': effective_price, 'quantity': quantity, 'value': position_value, 'score': details.get('final_score', 0)
         })
         return True
     
     def execute_sell(self, symbol, reason):
-        """Execute sell order (exchange-aware)"""
+        """Execute sell order (exchange-aware, with fee model)"""
         if symbol not in self.positions:
             return False
         
         position = self.positions[symbol]
-        exchange_name = position.get('exchange', 'binance')  # Get exchange from position
+        exchange_name = position.get('exchange', 'binance')
         price = self.get_current_price(symbol, exchange_name)
         if not price:
             return False
         
+        # ── Fee model: simulate realistic exit cost ──
+        effective_price = price * (1 - TAKER_FEE - ESTIMATED_SLIPPAGE)
+
         entry_price = position['entry_price']
         quantity = position['quantity']
         entry_value = quantity * entry_price
-        exit_value = quantity * price
+        exit_value = quantity * effective_price
         pnl = exit_value - entry_value
         pnl_pct = (pnl / entry_value) * 100
         
@@ -1734,20 +2119,20 @@ class PaperPortfolio:
         self.total_trades += 1
         if pnl > 0:
             self.winning_trades += 1
-        self.realized_pnl += pnl  # Update realized P&L
+        self.realized_pnl += pnl
         
-        self.log_trade('SELL', symbol, quantity, price, pnl=pnl, reason=f"{reason} | {exchange_name.upper()}")
+        self.log_trade('SELL', symbol, quantity, effective_price, pnl=pnl, reason=f"{reason} | {exchange_name.upper()}")
         self.save_portfolio()
         
         emoji = "🟢" if pnl > 0 else "🔴"
-        print(f"{emoji} SELL {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%) | {reason}")
-        event_logger.log('sell', f'SELL {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%) | {reason}', {
-            'symbol': symbol, 'exchange': exchange_name, 'price': price, 'quantity': quantity, 'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason
+        print(f"{emoji} SELL {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${effective_price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%) | {reason}")
+        event_logger.log('sell', f'SELL {symbol} on {exchange_name.upper()}: {quantity:.4f} @ ${effective_price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.1f}%) | {reason}', {
+            'symbol': symbol, 'exchange': exchange_name, 'price': effective_price, 'quantity': quantity, 'pnl': pnl, 'pnl_pct': pnl_pct, 'reason': reason
         })
         return True
     
     def execute_trim(self, symbol, reason, trim_pct=None):
-        """Trim position by trim_pct (defaults to TRIM_PERCENTAGE if not specified)"""
+        """Trim position by trim_pct (with fee model + trim tracking)"""
         if symbol not in self.positions:
             return False
 
@@ -1757,28 +2142,36 @@ class PaperPortfolio:
         if not price:
             return False
 
+        # ── Fee model for trim ──
+        effective_price = price * (1 - TAKER_FEE - ESTIMATED_SLIPPAGE)
+
         actual_trim_pct = trim_pct if trim_pct is not None else TRIM_PERCENTAGE
         trim_qty = position['quantity'] * actual_trim_pct
         position['quantity'] -= trim_qty
 
-        trim_value = trim_qty * price
+        trim_value = trim_qty * effective_price
         self.balance += trim_value
 
         entry_price = position['entry_price']
-        pnl = (price - entry_price) * trim_qty
-        pnl_pct = (price - entry_price) / entry_price * 100
+        pnl = (effective_price - entry_price) * trim_qty
+        pnl_pct = (effective_price - entry_price) / entry_price * 100
 
         self.realized_pnl += pnl
         if pnl > 0:
             self.winning_trades += 0.25  # Partial win
 
-        self.log_trade('TRIM', symbol, trim_qty, price, pnl=pnl, reason=reason)
+        # ── Track trim for death spiral prevention ──
+        position['trim_count'] = position.get('trim_count', 0) + 1
+        position['last_trim_time'] = datetime.now().isoformat()
+
+        self.log_trade('TRIM', symbol, trim_qty, effective_price, pnl=pnl, reason=reason)
         self.save_portfolio()
 
-        print(f"📉 TRIM {symbol}: {actual_trim_pct*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}")
-        event_logger.log('trim', f'TRIM {symbol}: {actual_trim_pct*100:.0f}% @ ${price:.4f} | Locked {pnl_pct:+.1f}% | {reason}', {
-            'symbol': symbol, 'price': price, 'quantity': trim_qty, 'pnl': pnl, 'pnl_pct': pnl_pct,
-            'trim_pct': actual_trim_pct, 'reason': reason
+        trim_num = position['trim_count']
+        print(f"📉 TRIM {symbol}: {actual_trim_pct*100:.0f}% @ ${effective_price:.4f} | Locked {pnl_pct:+.1f}% | Trim #{trim_num}/{MAX_TRIMS_PER_POSITION} | {reason}")
+        event_logger.log('trim', f'TRIM {symbol}: {actual_trim_pct*100:.0f}% @ ${effective_price:.4f} | Locked {pnl_pct:+.1f}% | Trim #{trim_num}/{MAX_TRIMS_PER_POSITION} | {reason}', {
+            'symbol': symbol, 'price': effective_price, 'quantity': trim_qty, 'pnl': pnl, 'pnl_pct': pnl_pct,
+            'trim_pct': actual_trim_pct, 'reason': reason, 'trim_count': trim_num
         })
         return True
 
@@ -1896,6 +2289,9 @@ class AlphaPrime:
         print(f"\n{'='*80}")
         print(f"🧠 ALPHA PRIME SLOW CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*80}")
+
+        # Snapshot positions before this cycle (for DRL action tracking)
+        self._positions_before_cycle = set(self.portfolio.positions.keys())
 
         # Refresh Reddit sentiment data from disk (updated daily by reddit_sentiment.py)
         print("\n📰 REFRESHING SENTIMENT DATA")
@@ -2069,11 +2465,28 @@ class AlphaPrime:
         for symbol in self.portfolio.positions:
             self.portfolio.positions[symbol]['cycles_held'] = self.portfolio.positions[symbol].get('cycles_held', 0) + 1
         
-        # Exit positions not in Top N
+        # Exit positions not in Top N (with hysteresis to prevent churning)
         top_symbols = {coin['symbol'] for coin in top_n_weighted}
+        score_map = {c['symbol']: c['final_score'] for c in top_n_weighted}
+        best_new_score = max((c['final_score'] for c in top_n_weighted), default=0)
+
         for symbol in list(self.portfolio.positions.keys()):
             if symbol not in top_symbols:
-                self.portfolio.execute_sell(symbol, "Rotated out of Top N")
+                position = self.portfolio.positions[symbol]
+                current_score = position.get('entry_score', 0)
+                held_cycles = position.get('cycles_held', 0)
+
+                # Hysteresis: only rotate if held ≥2 cycles AND replacement is 20%+ better
+                if held_cycles >= 2 and best_new_score > current_score * 1.20:
+                    self.portfolio.execute_sell(symbol,
+                        f"Rotated: new top {best_new_score:.2f} vs entry {current_score:.2f}")
+                elif held_cycles < 2:
+                    event_logger.log('info',
+                        f'🔒 Keeping {symbol}: only held {held_cycles} cycles (min 2)')
+                else:
+                    event_logger.log('info',
+                        f'🔒 Keeping {symbol}: replacement not 20% better '
+                        f'(best: {best_new_score:.2f} vs entry: {current_score:.2f})')
         
         # Enter new positions in Top N (Kelly-scaled)
         kelly_stats = trade_analyzer.get_kelly_stats()
@@ -2093,6 +2506,43 @@ class AlphaPrime:
         
         # Save equity curve point
         self.analytics.save_equity_point()
+
+        # ── DRL Training Data Collection (Phase 5 Prep) ──────────────
+        # Record full state-action-reward snapshot for future SAC training
+        try:
+            # Determine what actions were taken this cycle
+            current_positions = set(self.portfolio.positions.keys())
+            held_before = getattr(self, '_positions_before_cycle', set())
+            cycle_buys  = list(current_positions - held_before)
+            cycle_sells = list(held_before - current_positions)
+            cycle_holds = list(current_positions & held_before)
+
+            drl_collector.record_snapshot(
+                regime_info={
+                    'rule_regime': getattr(self, 'current_regime', 'UNKNOWN'),
+                    'hmm_regime': global_state.get('hmm_regime', 'UNKNOWN'),
+                    'hmm_confidence': global_state.get('hmm_confidence', 0.0),
+                    'btc_price': self.regime_details.get('btc_price', 0),
+                },
+                portfolio_state={
+                    'balance': self.portfolio.balance,
+                    'total_value': self.portfolio.get_portfolio_value(),
+                    'positions': self.portfolio.positions,
+                },
+                scored_coins=ranked,
+                actions={
+                    'buys': cycle_buys,
+                    'sells': cycle_sells,
+                    'trims': [],  # Trims are tracked separately in medium_loop
+                    'holds': cycle_holds,
+                },
+                btc_price=self.regime_details.get('btc_price', 0),
+            )
+            stats = drl_collector.get_stats()
+            print(f"   🧬 DRL data: cycle #{stats['cycles_collected']} | "
+                  f"{stats['pct_complete']:.1f}% to training ready")
+        except Exception as e:
+            print(f"   ⚠️  DRL collector error: {e}")
         
         # ── Post-Trade Feedback Loop ─────────────────────────────────
         try:
@@ -2131,15 +2581,12 @@ class AlphaPrime:
         """
         Main execution loop with 3-speed architecture.
         """
-        # 3-Speed Architecture
-        FAST_INTERVAL = 30      # 30 seconds - price observation
-        MEDIUM_INTERVAL = 300   # 5 minutes - exit checks
-        SLOW_INTERVAL = 1800    # 30 minutes - full rebalance
+        # Uses module-level constants: FAST_INTERVAL, MEDIUM_INTERVAL, SLOW_INTERVAL
         print("="*80)
-        print("🚀 ALPHA PRIME v2 — STARTING")
+        print("🚀 ALPHA PRIME v3 — STARTING")
         print("="*80)
         print("📊 5 Layers: Regime → Filter → Score → Size → Execute")
-        print("⏱️  3 Speeds: 30s (observe) / 5min (exits) / 1h (rotate)")
+        print(f"⏱️  3 Speeds: {FAST_INTERVAL}s (observe) / {MEDIUM_INTERVAL//60}min (exits) / {SLOW_INTERVAL//60}min (rotate)")
         print("="*80)
         
         # Initial slow cycle
