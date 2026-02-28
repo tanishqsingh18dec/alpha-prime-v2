@@ -28,6 +28,13 @@ import os
 import json
 import csv
 from datetime import datetime
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, 'item'):
+            return obj.item()
+        return super(NumpyEncoder, self).default(obj)
+
 from pathlib import Path
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────
@@ -249,7 +256,7 @@ class DRLDataCollector:
             }
 
             with open(SNAPSHOTS_FILE, 'a') as f:
-                f.write(json.dumps(snapshot) + '\n')
+                f.write(json.dumps(snapshot, cls=NumpyEncoder) + '\n')
 
             # ── Write CSV (flat feature vector) ──
             row = {

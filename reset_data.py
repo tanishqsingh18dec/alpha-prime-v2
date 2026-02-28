@@ -21,10 +21,10 @@ def reset_data():
         else:
             print(f"ℹ️  {file} not found (already clean)")
             
-    print("\n✨ Data reset complete. Ready for fresh start at $100.00.")
+    print("\n✨ Data reset complete. Ready for fresh start at $1000.00.")
 
 if __name__ == "__main__":
-    confirm = input("Are you sure you want to DELETE all trading history and reset to $100? (y/n): ")
+    confirm = input("Are you sure you want to DELETE all trading history and reset to $1000? (y/n): ")
     if confirm.lower() == 'y':
         reset_data()
     else:

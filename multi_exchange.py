@@ -160,7 +160,7 @@ class MultiExchangeScanner:
             # 4 fetches per coin, all concurrent
             tasks.append(self._safe_fetch(
                 sem, self._async_fetch_ohlcv,
-                symbol, exchange_name, '1d', 30,
+                symbol, exchange_name, '1d', 50,
                 results, symbol, 'ohlcv_1d'))
             tasks.append(self._safe_fetch(
                 sem, self._async_fetch_ohlcv,
