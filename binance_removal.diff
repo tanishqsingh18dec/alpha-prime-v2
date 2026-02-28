@@ -1,0 +1,170 @@
+diff --git a/12_alpha_prime.py b/12_alpha_prime.py
+index d99e7e5..026c854 100644
+--- a/12_alpha_prime.py
++++ b/12_alpha_prime.py
+@@ -106,7 +106,7 @@ MIN_COIN_VOLUME_24H = 1_000_000  # Lowered to $1M to catch more opportunities
+ DISCORD_URL = ""              # Optional webhook
+ 
+ # Multi-Exchange Configuration
+-ENABLED_EXCHANGES = ['binance', 'kucoin', 'gateio', 'mexc', 'bybit', 'kraken', 'bitget']  # All 7 major exchanges
++ENABLED_EXCHANGES = ['kucoin', 'gateio', 'mexc', 'bybit', 'kraken', 'bitget']  # Removed Binance due to AWS restrictions
+ 
+ # 3-Speed Architecture
+ FAST_INTERVAL = 30      # 30 seconds - price observation
+@@ -138,7 +138,7 @@ ENTRY_RSI_MAX = 75            # Don't buy if 4H RSI is above this
+ PORTFOLIO_FILE = "alpha_prime_portfolio.json"
+ TRADE_HISTORY_FILE = "alpha_prime_trades.csv"
+ 
+-exchange = ccxt.binance({'enableRateLimit': True})  # Keep for regime detection (BTC/ETH)
++exchange = ccxt.kucoin({'enableRateLimit': True})  # Keep for regime detection (BTC/ETH)
+ scanner = MultiExchangeScanner(ENABLED_EXCHANGES)   # Multi-exchange scanner
+ trade_analyzer = TradeAnalyzer(TRADE_HISTORY_FILE, scanner)  # Post-trade feedback + Kelly stats
+ 
+@@ -190,7 +190,7 @@ class RegimeDetector:
+                 btc_candles = prefetched_all['BTC/USDT']['ohlcv_4h']
+                 
+             if len(btc_candles) < 200:
+-                btc_candles = scanner.fetch_ohlcv('BTC/USDT', 'binance', '4h', limit=200)
++                btc_candles = scanner.fetch_ohlcv('BTC/USDT', 'kucoin', '4h', limit=200)
+             df = pd.DataFrame(btc_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+             
+             current_price = df['close'].iloc[-1]
+@@ -1349,7 +1349,7 @@ class PortfolioAnalytics:
+         """Save current portfolio value to equity curve"""
+         try:
+             portfolio_value = self.portfolio.get_total_value()
+-            btc_price = scanner.get_current_price('BTC/USDT', 'binance')
++            btc_price = scanner.get_current_price('BTC/USDT', 'kucoin')
+             
+             # Normalize to starting balance (100)
+             btc_normalized = 100 * (btc_price / self.get_initial_btc_price())
+@@ -1371,7 +1371,7 @@ class PortfolioAnalytics:
+     def get_initial_btc_price(self):
+         """Get BTC price at start (or use first saved price)"""
+         if self.equity_history:
+-            return self.equity_history[0]['btc_benchmark'] / 100 * scanner.get_current_price('BTC/USDT', 'binance')
++            return self.equity_history[0]['btc_benchmark'] / 100 * scanner.get_current_price('BTC/USDT', 'kucoin')
+         return scanner.get_current_price('BTC/USDT', 'binance')
+     
+     def calculate_nlv(self):
+@@ -1763,7 +1763,7 @@ class ExecutionEngine:
+         """
+         try:
+             # Use the exchange the position was actually traded on
+-            exchange_name = position.get('exchange', 'binance')
++            exchange_name = position.get('exchange', 'kucoin')
+             candles_4h = scanner.fetch_ohlcv(symbol, exchange_name, '4h', limit=50)
+             if not candles_4h or len(candles_4h) < 10:
+                 event_logger.log('warn', f'check_exit: no 4H data for {symbol} on {exchange_name}')
+@@ -1848,7 +1848,7 @@ class ExecutionEngine:
+             event_logger.log('error', f'check_exit_conditions FAILED for {symbol}: {e}')
+             return False, ""
+     
+-    def check_trim_conditions(self, symbol, exchange_name='binance'):
++    def check_trim_conditions(self, symbol, exchange_name='kucoin'):
+         """
+         Check if position should be trimmed.
+         Returns: (should_trim, reason, trim_pct)
+@@ -1998,7 +1998,7 @@ class PaperPortfolio:
+         else:
+             df.to_csv(TRADE_HISTORY_FILE, index=False)
+     
+-    def get_current_price(self, symbol, exchange_name='binance'):
++    def get_current_price(self, symbol, exchange_name='kucoin'):
+         """Get current price for symbol from specific exchange"""
+         try:
+             price = scanner.get_current_price(symbol, exchange_name)
+@@ -2010,7 +2010,7 @@ class PaperPortfolio:
+         """Calculate total portfolio value and update position stats"""
+         total = self.balance
+         for symbol, pos in self.positions.items():
+-            exchange_name = pos.get('exchange', 'binance')  # Get exchange from position
++            exchange_name = pos.get('exchange', 'kucoin')  # Get exchange from position
+             price = self.get_current_price(symbol, exchange_name)
+             if price:
+                 current_value = pos['quantity'] * price
+@@ -2036,7 +2036,7 @@ class PaperPortfolio:
+         if symbol in self.positions:
+             return False
+ 
+-        exchange_name = details.get('exchange', 'binance')
++        exchange_name = details.get('exchange', 'kucoin')
+ 
+         # ── Pre-trade Entry Guards (RSI + Spread) ──
+         # Data was already fetched and calculated instantaneously during scoring phase!
+@@ -2109,7 +2109,7 @@ class PaperPortfolio:
+             return False
+         
+         position = self.positions[symbol]
+-        exchange_name = position.get('exchange', 'binance')
++        exchange_name = position.get('exchange', 'kucoin')
+         price = self.get_current_price(symbol, exchange_name)
+         if not price:
+             return False
+@@ -2149,7 +2149,7 @@ class PaperPortfolio:
+             return False
+ 
+         position = self.positions[symbol]
+-        exchange_name = position.get('exchange', 'binance')
++        exchange_name = position.get('exchange', 'kucoin')
+         price = self.get_current_price(symbol, exchange_name)
+         if not price:
+             return False
+@@ -2262,7 +2262,7 @@ class AlphaPrime:
+         # If BTC drops > 1.5% in the last 5 minutes, pre-emptively trim
+         # ALL positions by 25% — correlation goes to 1.0 during crashes.
+         try:
+-            btc_5m = scanner.fetch_ohlcv('BTC/USDT', 'binance', '5m', limit=2)
++            btc_5m = scanner.fetch_ohlcv('BTC/USDT', 'kucoin', '5m', limit=2)
+             if btc_5m and len(btc_5m) >= 2:
+                 btc_prev_close = btc_5m[-2][4]
+                 btc_curr_close = btc_5m[-1][4]
+@@ -2286,7 +2286,7 @@ class AlphaPrime:
+                 continue
+             
+             # Trim checks (only if not exiting)
+-            exchange_name = position.get('exchange', 'binance')
++            exchange_name = position.get('exchange', 'kucoin')
+             should_trim, trim_reason, trim_pct = self.executor.check_trim_conditions(symbol, exchange_name)
+             if should_trim:
+                 self.portfolio.execute_trim(symbol, trim_reason, trim_pct=trim_pct)
+@@ -2462,7 +2462,7 @@ class AlphaPrime:
+ 
+         # Log top coins as signal events
+         for coin in top_n:
+-            event_logger.log('signal', f'RANKED #{top_n.index(coin)+1}: {coin["symbol"]} | Score: {coin["final_score"]:.4f} | Mom7d: {coin["momentum_7d"]:.1%} | {coin.get("exchange","binance").upper()}')
++            event_logger.log('signal', f'RANKED #{top_n.index(coin)+1}: {coin["symbol"]} | Score: {coin["final_score"]:.4f} | Mom7d: {coin["momentum_7d"]:.1%} | {coin.get("exchange","kucoin").upper()}')
+ 
+         # LAYER 4: Position Sizing (Portfolio Optimizer → Inverse-Vol fallback)
+         print("\n💰 LAYER 4: POSITION SIZING (Max-Sharpe Optimizer)")
+@@ -3731,7 +3731,7 @@ def api_positions():
+         positions_list = []
+         for symbol, pos in portfolio.positions.items():
+             try:
+-                exchange = pos.get('exchange', 'binance')
++                exchange = pos.get('exchange', 'kucoin')
+                 current_price = portfolio.get_current_price(symbol, exchange)
+                 
+                 if not current_price:
+@@ -3800,7 +3800,7 @@ def api_top_ranked():
+             ranked.append({
+                 'rank': i + 1,
+                 'symbol': coin.get('symbol', ''),
+-                'exchange': coin.get('exchange', 'binance'),
++                'exchange': coin.get('exchange', 'kucoin'),
+                 'final_score': float(coin.get('final_score', 0)),
+                 'momentum_7d': float(coin.get('momentum_7d', 0)),
+                 'momentum_24h': float(coin.get('momentum_24h', 0)),
+diff --git a/multi_exchange.py b/multi_exchange.py
+index 208ebab..046d134 100644
+--- a/multi_exchange.py
++++ b/multi_exchange.py
+@@ -148,7 +148,7 @@ class MultiExchangeScanner:
+ 
+         for coin in coin_data_list:
+             symbol = coin['symbol']
+-            exchange_name = coin.get('exchange', 'binance')
++            exchange_name = coin.get('exchange', 'kucoin')
+             results[symbol] = {
+                 'ohlcv_1d': [],
+                 'ohlcv_4h': [],

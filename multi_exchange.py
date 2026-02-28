@@ -11,6 +11,7 @@ Architecture:
 import ccxt
 import ccxt.async_support as ccxt_async
 import asyncio
+import os
 from datetime import datetime
 
 # Exchanges that support perpetual futures via CCXT (used for funding/OI)
@@ -66,23 +67,41 @@ class MultiExchangeScanner:
     def _init_exchange(self, name, market_type='spot'):
         """Initialize a single sync exchange connection."""
         exchange_class = getattr(ccxt, name)
-        exchange = exchange_class({
+        options = {
             'enableRateLimit': True,
             'options': {
                 'defaultType': market_type,
             }
-        })
+        }
+        
+        # Apply proxy to Binance to bypass regional blocks (e.g., AWS US IPs)
+        if name == 'binance' and os.environ.get('BINANCE_PROXY'):
+            options['proxies'] = {
+                'http': os.environ.get('BINANCE_PROXY'),
+                'https': os.environ.get('BINANCE_PROXY')
+            }
+            
+        exchange = exchange_class(options)
         return exchange
 
     def _init_async_exchange(self, name, market_type='spot'):
         """Initialize a single async exchange connection (separate instance)."""
         exchange_class = getattr(ccxt_async, name)
-        exchange = exchange_class({
+        options = {
             'enableRateLimit': True,
             'options': {
                 'defaultType': market_type,
             }
-        })
+        }
+        
+        # Apply proxy to Binance to bypass regional blocks (e.g., AWS US IPs)
+        if name == 'binance' and os.environ.get('BINANCE_PROXY'):
+            options['proxies'] = {
+                'http': os.environ.get('BINANCE_PROXY'),
+                'https': os.environ.get('BINANCE_PROXY')
+            }
+            
+        exchange = exchange_class(options)
         return exchange
 
     # =========================================================================

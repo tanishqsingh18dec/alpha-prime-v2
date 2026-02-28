@@ -138,7 +138,14 @@ ENTRY_RSI_MAX = 75            # Don't buy if 4H RSI is above this
 PORTFOLIO_FILE = "alpha_prime_portfolio.json"
 TRADE_HISTORY_FILE = "alpha_prime_trades.csv"
 
-exchange = ccxt.binance({'enableRateLimit': True})  # Keep for regime detection (BTC/ETH)
+# Proxy configuration for Binance to bypass regional blocks (e.g. AWS US IPs)
+binance_options = {'enableRateLimit': True}
+if os.environ.get('BINANCE_PROXY'):
+    binance_options['proxies'] = {
+        'http': os.environ.get('BINANCE_PROXY'),
+        'https': os.environ.get('BINANCE_PROXY')
+    }
+exchange = ccxt.binance(binance_options)  # Keep for regime detection (BTC/ETH)
 scanner = MultiExchangeScanner(ENABLED_EXCHANGES)   # Multi-exchange scanner
 trade_analyzer = TradeAnalyzer(TRADE_HISTORY_FILE, scanner)  # Post-trade feedback + Kelly stats
 
